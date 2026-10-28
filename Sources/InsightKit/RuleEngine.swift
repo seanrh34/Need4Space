@@ -1,12 +1,18 @@
 import Foundation
 import ScannerKit
 
+/// Restriction inherited by files inside a rule-matched area.
+struct RuleRestriction: Sendable {
+    var risk: Risk
+    var action: SuggestedAction
+}
+
 struct RuleEvaluation: Sendable {
     var insights: [Insight]
     /// Every node claimed by a produced insight, used to avoid double counting elsewhere.
     var claimed: Set<NodeID>
-    /// Nodes inside careful rules (Mail, Messages, Photos, Docker, swap). Used to protect stale files.
-    var protected: [NodeID: SuggestedAction]
+    /// Every rule-matched node, so stale-file detection can inherit the rule's restriction.
+    var restrictions: [NodeID: RuleRestriction]
 }
 
 /// Turns the rule table into insights. All work is linear in the tree size; only the handful of
@@ -20,6 +26,11 @@ public struct RuleEngine: Sendable {
         self.maxPathsPerInsight = max(0, maxPathsPerInsight)
     }
 
+    private struct RawMatch {
+        var id: NodeID
+        var perItem: Bool
+    }
+
     private struct MatchItem {
         var id: NodeID
         var bytes: UInt64
@@ -29,12 +40,12 @@ public struct RuleEngine: Sendable {
     func evaluate(tree: ScanTree, homePath: String) -> RuleEvaluation {
         var insights: [Insight] = []
         var claimed = Set<NodeID>()
-        var protected: [NodeID: SuggestedAction] = [:]
+        var restrictions: [NodeID: RuleRestriction] = [:]
         let home = PathSupport.normalize(homePath)
 
         for rule in rules {
             var seen = Set<NodeID>()
-            var rawMatches: [NodeID] = []
+            var rawMatches: [RawMatch] = []
 
             for pattern in rule.patterns {
                 let found = Self.nodes(
@@ -43,22 +54,13 @@ public struct RuleEngine: Sendable {
                     homePath: home,
                     claimed: claimed
                 )
-                if rule.risk == .careful {
-                    for id in found { protected[id] = rule.action }
-                }
+                let restriction = RuleRestriction(risk: rule.risk, action: rule.action)
+                let perItem = Self.isPerItemPattern(pattern)
                 for id in found {
                     guard Int(id) >= 0, Int(id) < tree.count else { continue }
-                    let include: Bool
-                    switch pattern {
-                    case .home(_), .absolute(_):
-                        include = tree.allocSize[Int(id)] >= rule.minBytes
-                    case .downloads:
-                        include = true
-                    case .homeGlobChildren(_), .homeGlob(_), .anyDirectoryNamed(_):
-                        include = tree.allocSize[Int(id)] >= rule.minBytes
-                    }
-                    if include, seen.insert(id).inserted {
-                        rawMatches.append(id)
+                    restrictions[id] = Self.mergeRestriction(restrictions[id], restriction)
+                    if seen.insert(id).inserted {
+                        rawMatches.append(RawMatch(id: id, perItem: perItem))
                     }
                 }
             }
@@ -71,30 +73,57 @@ public struct RuleEngine: Sendable {
             let usesProjectDate = Self.hasAnyDirectoryNamedPattern(rule)
 
             var items: [MatchItem] = []
-            items.reserveCapacity(rawMatches.count)
-            for id in rawMatches {
+            for match in rawMatches {
                 if !claimed.isEmpty,
-                   Self.isClaimedOrInsideClaimed(id, tree: tree, claimed: claimed) {
+                   Self.isClaimedOrInsideClaimed(match.id, tree: tree, claimed: claimed) {
                     continue
                 }
-                var bytes = tree.allocSize[Int(id)]
-                if let claimedSubtree {
-                    let inside = claimedSubtree[Int(id)]
-                    if inside > 0 {
-                        bytes = bytes > inside ? bytes - inside : 0
-                    }
-                }
-                guard bytes > 0 else { continue }
-                let projectModTime: Int64
-                if usesProjectDate {
-                    let parent = tree.parent[Int(id)]
-                    projectModTime = parent >= 0 ? tree.modTime[Int(parent)] : 0
+                let inside = claimedSubtree?[Int(match.id)] ?? 0
+                if inside == 0 {
+                    let bytes = tree.allocSize[Int(match.id)]
+                    guard bytes > 0 else { continue }
+                    // Per-item minima are evaluated on the bytes left after earlier claims.
+                    guard !match.perItem || bytes >= rule.minBytes else { continue }
+                    items.append(
+                        MatchItem(
+                            id: match.id,
+                            bytes: bytes,
+                            projectModTime: Self.projectModTime(
+                                for: match.id,
+                                tree: tree,
+                                usesProjectDate: usesProjectDate
+                            )
+                        )
+                    )
+                    claimed.insert(match.id)
                 } else {
-                    projectModTime = 0
+                    // Never offer an action on a parent that mixes claimed and unclaimed nodes.
+                    // Replace it with the unclaimed frontier so every actionable node is clean.
+                    let frontier = Self.unclaimedFrontier(
+                        under: match.id,
+                        tree: tree,
+                        claimed: claimed,
+                        claimedSubtree: claimedSubtree ?? []
+                    )
+                    for child in frontier {
+                        let bytes = tree.allocSize[Int(child)]
+                        guard bytes > 0 else { continue }
+                        guard !match.perItem || bytes >= rule.minBytes else { continue }
+                        items.append(
+                            MatchItem(
+                                id: child,
+                                bytes: bytes,
+                                projectModTime: Self.projectModTime(
+                                    for: child,
+                                    tree: tree,
+                                    usesProjectDate: usesProjectDate
+                                )
+                            )
+                        )
+                        claimed.insert(child)
+                    }
+                    claimed.insert(match.id)
                 }
-                items.append(
-                    MatchItem(id: id, bytes: bytes, projectModTime: projectModTime)
-                )
             }
 
             guard !items.isEmpty else { continue }
@@ -143,9 +172,9 @@ public struct RuleEngine: Sendable {
                 in: tree,
                 limit: maxPathsPerInsight
             )
-            let primaryPath = paths.first?.path ?? tree.rootPath
+            let scopePath = Self.scopePath(for: rule, homePath: home, tree: tree)
             let insight = Insight(
-                id: "\(rule.id):\(primaryPath)",
+                id: "\(rule.id):\(scopePath)",
                 title: rule.title,
                 detail: rule.detail,
                 nodeIDs: sorted.map { $0.id },
@@ -158,13 +187,52 @@ public struct RuleEngine: Sendable {
                 category: rule.category
             )
             insights.append(insight)
-            for item in items { claimed.insert(item.id) }
         }
 
-        return RuleEvaluation(insights: insights, claimed: claimed, protected: protected)
+        return RuleEvaluation(
+            insights: insights,
+            claimed: claimed,
+            restrictions: restrictions
+        )
     }
 
     // MARK: - Overlap helpers
+
+    private static func mergeRestriction(
+        _ existing: RuleRestriction?,
+        _ new: RuleRestriction
+    ) -> RuleRestriction {
+        guard let existing else { return new }
+        let risk: Risk = new.risk.severity > existing.risk.severity ? new.risk : existing.risk
+        let action: SuggestedAction
+        if case .displayOnly = existing.action {
+            action = existing.action
+        } else if case .displayOnly = new.action {
+            action = new.action
+        } else {
+            action = existing.action
+        }
+        return RuleRestriction(risk: risk, action: action)
+    }
+
+    private static func isPerItemPattern(_ pattern: PathPattern) -> Bool {
+        switch pattern {
+        case .homeGlobChildren(_), .homeGlob(_), .anyDirectoryNamed(_):
+            return true
+        case .home(_), .absolute(_), .downloads:
+            return false
+        }
+    }
+
+    private static func projectModTime(
+        for id: NodeID,
+        tree: ScanTree,
+        usesProjectDate: Bool
+    ) -> Int64 {
+        guard usesProjectDate else { return 0 }
+        let parent = tree.parent[Int(id)]
+        return parent >= 0 ? tree.modTime[Int(parent)] : 0
+    }
 
     private static func hasAnyDirectoryNamedPattern(_ rule: Rule) -> Bool {
         for pattern in rule.patterns {
@@ -209,6 +277,64 @@ public struct RuleEngine: Sendable {
             index -= 1
         }
         return subtree
+    }
+
+    /// Nodes below `root` whose subtrees contain no claimed bytes. Mixed directories are walked so
+    /// the result is a set of directly actionable, fully unclaimed nodes. Mixed bundles are skipped
+    /// because a bundle cannot be split safely.
+    private static func unclaimedFrontier(
+        under root: NodeID,
+        tree: ScanTree,
+        claimed: Set<NodeID>,
+        claimedSubtree: [UInt64]
+    ) -> [NodeID] {
+        var result: [NodeID] = []
+        var stack: [NodeID] = []
+        var child = tree.firstChild[Int(root)]
+        while child >= 0 {
+            stack.append(child)
+            child = tree.nextSibling[Int(child)]
+        }
+        while let id = stack.popLast() {
+            if claimed.contains(id) { continue }
+            let index = Int(id)
+            let inside = claimedSubtree[index]
+            if inside == 0 {
+                result.append(id)
+                continue
+            }
+            if inside >= tree.allocSize[index] { continue }
+            let kind = tree.kind[index]
+            guard kind.isContainer, kind != .bundle else { continue }
+            var nested = tree.firstChild[index]
+            while nested >= 0 {
+                stack.append(nested)
+                nested = tree.nextSibling[Int(nested)]
+            }
+        }
+        return result
+    }
+
+    // MARK: - Scope path (stable insight id)
+
+    private static func scopePath(for rule: Rule, homePath: String, tree: ScanTree) -> String {
+        guard let first = rule.patterns.first else { return tree.rootPath }
+        switch first {
+        case .home(let relative), .homeGlobChildren(let relative):
+            return PathSupport.join(homePath, relative)
+        case .absolute(let absolute):
+            return absolute
+        case .homeGlob(let glob):
+            let parts = glob.split(separator: "/", omittingEmptySubsequences: true)
+            let parentRelative = parts.dropLast().joined(separator: "/")
+            return parentRelative.isEmpty
+                ? homePath
+                : PathSupport.join(homePath, parentRelative)
+        case .anyDirectoryNamed(_):
+            return homePath
+        case .downloads:
+            return PathSupport.join(homePath, "Downloads")
+        }
     }
 
     // MARK: - Pattern resolution
@@ -308,6 +434,7 @@ public struct RuleEngine: Sendable {
     ) -> [NodeID] {
         guard tree.count > 0, !names.isEmpty else { return [] }
         guard let homeNode = tree.node(atPath: homePath) else { return [] }
+        if claimed.contains(homeNode) { return [] }
 
         let candidates = names.map { Array($0.utf8) }
         let homeLibrary = tree.child(of: homeNode, named: "Library")

@@ -11,6 +11,17 @@ public enum Risk: String, Sendable, Hashable, CaseIterable, Codable {
     case careful
 }
 
+extension Risk {
+    /// Used to merge restrictions inherited from several containing rules.
+    var severity: Int {
+        switch self {
+        case .safe: return 0
+        case .review: return 1
+        case .careful: return 2
+        }
+    }
+}
+
 /// The action the UI may offer for an insight.
 ///
 /// Deliberately there is no programmatic "empty Trash" action: per PLAN revision 14 the Trash

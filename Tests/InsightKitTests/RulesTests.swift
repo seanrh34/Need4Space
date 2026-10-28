@@ -138,9 +138,29 @@ private func containsInsight(_ insights: [Insight], _ id: String) -> Bool {
         ]),
     ])
     let insight = try #require(find(insights(tree), "userCaches"))
+    #expect(insight.id == "userCaches:\(home)/Library/Caches")
     #expect(insight.bytes == 550 * mb)
     #expect(insight.nodeIDs.count == 2)
     #expect(insight.children.count == 2)
+}
+
+@Test func groupedRuleIDDoesNotDependOnLargestMatch() throws {
+    func tree(smallFirst: Bool) -> ScanTree {
+        let a: UInt64 = smallFirst ? 250 * mb : 500 * mb
+        let b: UInt64 = smallFirst ? 500 * mb : 250 * mb
+        return FixtureTree.build([
+            .dir("Library", [
+                .dir("Caches", [
+                    .dir("com.example.a", [.file("f", a)]),
+                    .dir("com.example.b", [.file("f", b)]),
+                ]),
+            ]),
+        ])
+    }
+    let first = try #require(find(insights(tree(smallFirst: true)), "userCaches"))
+    let second = try #require(find(insights(tree(smallFirst: false)), "userCaches"))
+    #expect(first.id == "userCaches:\(home)/Library/Caches")
+    #expect(second.id == first.id)
 }
 
 @Test func globMatchesRespectPerItemMinimum() throws {
@@ -224,6 +244,7 @@ private func containsInsight(_ insights: [Insight], _ id: String) -> Bool {
     let rule = try #require(RuleTable.all.first { $0.id == "developer.buildOutputs" })
     let result = RuleEngine(rules: [rule]).evaluate(tree: tree, homePath: home)
     let insight = try #require(result.insights.first)
+    #expect(insight.id == "developer.buildOutputs:\(home)")
     #expect(insight.nodeIDs.count == 2)
     #expect(insight.children.count == 2)
     #expect(insight.children.first?.bytes == 350 * mb)
@@ -334,9 +355,62 @@ private func containsInsight(_ insights: [Insight], _ id: String) -> Bool {
     let parentInsight = try #require(
         result.insights.first { $0.id.hasPrefix("parent:") }
     )
+    #expect(parentInsight.id == "parent:\(home)/Library/Caches")
     #expect(parentInsight.bytes == 300 * mb)
     let cachesNode = try #require(tree.node(atPath: home + "/Library/Caches"))
-    #expect(parentInsight.nodeIDs == [cachesNode])
+    let otherNode = try #require(tree.node(atPath: home + "/Library/Caches/com.example.other"))
+    #expect(parentInsight.nodeIDs == [otherNode])
+    #expect(parentInsight.nodeIDs.contains(cachesNode) == false)
+}
+
+@Test func perItemMinimumIsCheckedAfterClaimedBytesAreSubtracted() throws {
+    let tree = FixtureTree.build([
+        .dir("Library", [
+            .dir("Caches", [
+                .dir("Mixed", [
+                    .dir("Claimed", [.file("data", 400 * mb)]),
+                    .dir("Small", [.file("data", 100 * mb)]),
+                ]),
+            ]),
+        ]),
+    ])
+    let specific = Rule(
+        id: "specific",
+        title: "Claimed part",
+        detail: "",
+        patterns: [.home("Library/Caches/Mixed/Claimed")],
+        risk: .safe,
+        action: .trash
+    )
+    let itemRule = Rule(
+        id: "mixed",
+        title: "Mixed caches",
+        detail: "",
+        patterns: [.homeGlobChildren("Library/Caches")],
+        risk: .safe,
+        action: .trash
+    )
+    let result = RuleEngine(rules: [specific, itemRule])
+        .evaluate(tree: tree, homePath: home)
+    #expect(result.insights.contains(where: { $0.id.hasPrefix("mixed:") }) == false)
+
+    // With enough residual bytes the unclaimed child is reported in place of the parent.
+    let bigger = FixtureTree.build([
+        .dir("Library", [
+            .dir("Caches", [
+                .dir("Mixed", [
+                    .dir("Claimed", [.file("data", 400 * mb)]),
+                    .dir("BigEnough", [.file("data", 250 * mb)]),
+                ]),
+            ]),
+        ]),
+    ])
+    let second = RuleEngine(rules: [specific, itemRule])
+        .evaluate(tree: bigger, homePath: home)
+    let mixed = try #require(second.insights.first { $0.id.hasPrefix("mixed:") })
+    let child = try #require(bigger.node(atPath: home + "/Library/Caches/Mixed/BigEnough"))
+    #expect(mixed.nodeIDs == [child])
+    #expect(mixed.bytes == 250 * mb)
 }
 
 @Test func copyCommandsAreData() {
@@ -371,6 +445,7 @@ private func containsInsight(_ insights: [Insight], _ id: String) -> Bool {
         ]),
     ])
     let insight = try #require(find(insights(tree), "vms"))
+    #expect(insight.id == "vms:\(home)/Parallels")
     #expect(insight.bytes == 1 * gb + 500 * mb)
     #expect(insight.nodeIDs.count == 2)
 }

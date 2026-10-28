@@ -177,26 +177,38 @@ enum Outliers {
         now: Date,
         homePath: String,
         config: InsightsConfig,
-        protected: [NodeID: SuggestedAction] = [:]
+        restrictions: [NodeID: RuleRestriction] = [:]
     ) -> [Insight] {
         let nodeCount = tree.count
         let nowSeconds = Int64(now.timeIntervalSince1970)
         let ageSeconds = Int64(config.staleFileAgeDays) * 86_400
         guard ageSeconds > 0, nodeCount > 0 else { return [] }
 
-        // One forward pass: parents have lower indices than their children.
+        // One forward pass: parents have lower indices than their children. The arrays describe
+        // the *proper ancestors* of each node, so a file that is itself a rule match (a download)
+        // is not restricted by its own rule.
+        var insideRule = [Bool](repeating: false, count: nodeCount)
         var insideBundle = [Bool](repeating: false, count: nodeCount)
-        var inheritedProtection = [UInt8](repeating: 0, count: nodeCount)
+        var inheritedRisk = [UInt8](repeating: 0, count: nodeCount)
+        var displayOnly = [Bool](repeating: false, count: nodeCount)
         var index = 0
         while index < nodeCount {
             let parent = Int(tree.parent[index])
             if parent >= 0 {
-                insideBundle[index] = insideBundle[parent]
-                inheritedProtection[index] = inheritedProtection[parent]
-            }
-            if tree.kind[index] == .bundle { insideBundle[index] = true }
-            if let action = protected[NodeID(index)] {
-                inheritedProtection[index] = Self.protectionCode(action)
+                let parentID = NodeID(parent)
+                insideRule[index] = insideRule[parent] || restrictions[parentID] != nil
+                insideBundle[index] = insideBundle[parent] || tree.kind[parent] == .bundle
+                inheritedRisk[index] = inheritedRisk[parent]
+                displayOnly[index] = displayOnly[parent]
+                if let restriction = restrictions[parentID] {
+                    let severity = UInt8(clamping: restriction.risk.severity)
+                    if severity > inheritedRisk[index] {
+                        inheritedRisk[index] = severity
+                    }
+                    if case .displayOnly = restriction.action {
+                        displayOnly[index] = true
+                    }
+                }
             }
             index += 1
         }
@@ -205,8 +217,7 @@ enum Outliers {
         index = 0
         while index < nodeCount {
             if tree.kind[index] == .file,
-               tree.allocSize[index] >= config.staleFileMinBytes,
-               !insideBundle[index] {
+               tree.allocSize[index] >= config.staleFileMinBytes {
                 let access = tree.accessTime[index]
                 let modified = tree.modTime[index]
                 let timestamp = access != 0 ? access : modified
@@ -215,19 +226,22 @@ enum Outliers {
                     if elapsed >= ageSeconds {
                         let id = NodeID(index)
                         let usedAccessTime = access != 0
-                        let protection = inheritedProtection[index]
-                        let risk: Risk = protection == 0 ? .review : .careful
+                        let restricted = insideRule[index] || insideBundle[index]
+                        let risk: Risk
                         let action: SuggestedAction
-                        switch protection {
-                        case 2: action = .displayOnly
-                        case 1: action = .revealOnly
-                        default: action = .trash
+                        if restricted {
+                            let severity = max(1, Int(inheritedRisk[index]))
+                            risk = severity >= 2 ? .careful : .review
+                            action = displayOnly[index] ? .displayOnly : .revealOnly
+                        } else {
+                            risk = .review
+                            action = .trash
                         }
                         var detail = usedAccessTime
                             ? "Last accessed \(config.staleFileAgeDays) days ago or more."
                             : "Access time is unavailable; last modified \(config.staleFileAgeDays) days ago or more."
-                        if protection != 0 {
-                            detail += " This file is inside a location that should not be trashed from this app."
+                        if restricted {
+                            detail += " This file is inside a rule-matched area or an app bundle, so it is not offered for trashing here."
                         }
                         let path = tree.path(id)
                         insights.append(
@@ -251,11 +265,6 @@ enum Outliers {
         }
         insights.sort { $0.bytes > $1.bytes }
         return insights
-    }
-
-    private static func protectionCode(_ action: SuggestedAction) -> UInt8 {
-        if case .displayOnly = action { return 2 }
-        return 1
     }
 
     // MARK: - Fast growers
@@ -286,32 +295,59 @@ enum Outliers {
         )
         guard !grown.isEmpty else { return [] }
 
-        // Report only the deepest folders where the growth is concentrated. A parent whose bytes
-        // grew because one child grew would otherwise double count that child in the total.
+        // A parent whose bytes grew because a child grew is not dropped: we subtract the rows
+        // reported below it and report the parent's residual growth if that is still >= 1 GB.
+        // This keeps the total complete without counting any growth twice.
         let candidates = Set(grown.map { $0.id })
-        var hasCandidateDescendant = Set<NodeID>()
+        var nearestCandidate: [NodeID: NodeID] = [:]
         for item in grown {
             var parent = tree.parent[Int(item.id)]
             while parent >= 0 {
                 let parentID = NodeID(parent)
-                if candidates.contains(parentID) { hasCandidateDescendant.insert(parentID) }
+                if candidates.contains(parentID) {
+                    nearestCandidate[item.id] = parentID
+                    break
+                }
                 parent = tree.parent[Int(parent)]
             }
         }
-        var reported = grown.filter { !hasCandidateDescendant.contains($0.id) }
-        guard !reported.isEmpty else { return [] }
-        reported.sort { lhs, rhs in
+
+        let deepestFirst = grown.sorted { lhs, rhs in
+            let lhsDepth = tree.depth(lhs.id)
+            let rhsDepth = tree.depth(rhs.id)
+            if lhsDepth != rhsDepth { return lhsDepth > rhsDepth }
+            return lhs.id < rhs.id
+        }
+        var reportedBelow: [NodeID: UInt64] = [:]
+        var rows: [(id: NodeID, growth: UInt64)] = []
+        for item in deepestFirst {
+            let below = reportedBelow[item.id] ?? 0
+            let residual = item.growth > below ? item.growth - below : 0
+            let rowBytes = residual >= config.growthMinBytes ? residual : 0
+            let covered = InsightBuilder.saturatingAdd(below, rowBytes)
+            if let parent = nearestCandidate[item.id] {
+                reportedBelow[parent] = InsightBuilder.saturatingAdd(
+                    reportedBelow[parent] ?? 0,
+                    covered
+                )
+            }
+            if rowBytes > 0 {
+                rows.append((id: item.id, growth: rowBytes))
+            }
+        }
+        guard !rows.isEmpty else { return [] }
+        rows.sort { lhs, rhs in
             if lhs.growth != rhs.growth { return lhs.growth > rhs.growth }
             return lhs.id < rhs.id
         }
 
         var total: UInt64 = 0
-        for item in reported { total = InsightBuilder.saturatingAdd(total, item.growth) }
-        let ids = reported.map { $0.id }
-        let children = reported.prefix(10).map { item in
+        for item in rows { total = InsightBuilder.saturatingAdd(total, item.growth) }
+        let ids = rows.map { $0.id }
+        let children = rows.prefix(10).map { item in
             InsightChild(name: tree.name(item.id), bytes: item.growth, nodeID: item.id)
         }
-        let paths = reported.prefix(config.maxPathsPerInsight).map {
+        let paths = rows.prefix(config.maxPathsPerInsight).map {
             URL(fileURLWithPath: tree.path($0.id))
         }
         let gigabytes = Double(config.growthMinBytes) / (1024.0 * 1024.0 * 1024.0)

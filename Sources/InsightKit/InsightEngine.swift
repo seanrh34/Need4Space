@@ -49,7 +49,7 @@ public struct InsightEngine: Sendable {
                 now: now,
                 homePath: home,
                 config: config,
-                protected: ruleEvaluation.protected
+                restrictions: ruleEvaluation.restrictions
             )
         )
         insights.append(

@@ -65,6 +65,9 @@ private let gb = Size.gb
     #expect(report.reclaimableSafeBytes == 1100 * mb)
     #expect(report.hidden.gapBytes > 0)
     #expect(report.hidden.blockedCount == 1)
+    let plainStale = report.insights.first { $0.id.hasPrefix("staleFile:") }
+    #expect(plainStale?.risk == .review)
+    #expect(plainStale?.action == .trash)
 
     let bar = try #require(report.apps.first)
     #expect(bar.name == "Bar")
@@ -92,7 +95,7 @@ private let gb = Size.gb
     #expect(report.insights.first?.id.hasPrefix("trash:") == true)
 }
 
-@Test func engineProtectsStaleFilesInsideCarefulRulesAndBundles() {
+@Test func engineProtectsStaleFilesInsideCarefulRulesAndBundles() throws {
     let now = Date(timeIntervalSince1970: 1_800_000_000)
     let nowSeconds = Int64(now.timeIntervalSince1970)
     let day: Int64 = 86_400
@@ -114,8 +117,68 @@ private let gb = Size.gb
     ])
     let report = InsightEngine().run(tree: tree, homePath: home, now: now)
     let stale = report.insights.filter { $0.id.hasPrefix("staleFile:") }
+    #expect(stale.count == 2)
+    let mailStale = try #require(
+        stale.first { $0.paths.first?.path.contains("/Library/Mail/") == true }
+    )
+    #expect(mailStale.risk == .careful)
+    #expect(mailStale.action == .revealOnly)
+    let appStale = try #require(
+        stale.first { $0.paths.first?.path.contains("/Foo.app/") == true }
+    )
+    #expect(appStale.risk == .review)
+    #expect(appStale.action == .revealOnly)
+}
+
+@Test func engineProtectsStaleFilesInsideReviewRules() {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let nowSeconds = Int64(now.timeIntervalSince1970)
+    let day: Int64 = 86_400
+    let tree = FixtureTree.build([
+        .dir("Library", [
+            .dir("Developer", [
+                .dir("Xcode", [
+                    .dir("Archives", [
+                        .bundle("App.xcarchive", [
+                            .file("old.bin", 600 * mb, modTime: nowSeconds - 400 * day),
+                        ]),
+                    ]),
+                ]),
+            ]),
+            .dir("Application Support", [
+                .dir("MobileSync", [
+                    .dir("Backup", [
+                        .file("Manifest.db", 600 * mb, modTime: nowSeconds - 400 * day),
+                    ]),
+                ]),
+            ]),
+        ]),
+    ])
+    let report = InsightEngine().run(tree: tree, homePath: home, now: now)
+    let stale = report.insights.filter { $0.id.hasPrefix("staleFile:") }
+    #expect(stale.count == 2)
+    #expect(stale.allSatisfy({ $0.risk == .review && $0.action == .revealOnly }))
+}
+
+@Test func engineProtectsStaleFilesInsideSafeTrashRules() {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let nowSeconds = Int64(now.timeIntervalSince1970)
+    let day: Int64 = 86_400
+    let tree = FixtureTree.build([
+        .dir("Library", [
+            .dir("Developer", [
+                .dir("Xcode", [
+                    .dir("DerivedData", [
+                        .file("old.o", 600 * mb, modTime: nowSeconds - 400 * day),
+                    ]),
+                ]),
+            ]),
+        ]),
+    ])
+    let report = InsightEngine().run(tree: tree, homePath: home, now: now)
+    let stale = report.insights.filter { $0.id.hasPrefix("staleFile:") }
     #expect(stale.count == 1)
-    #expect(stale.first?.risk == .careful)
+    #expect(stale.first?.risk == .review)
     #expect(stale.first?.action == .revealOnly)
 }
 

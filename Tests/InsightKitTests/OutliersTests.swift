@@ -184,6 +184,34 @@ private let gb = Size.gb
     #expect(insight.children.last?.name == "Grew")
 }
 
+@Test func fastGrowersReportParentResidualGrowth() throws {
+    let old = FixtureTree.build([
+        .dir("Parent", [
+            .dir("Child", [.file("data", 100 * mb)]),
+            .file("other", 100 * mb),
+        ]),
+    ])
+    let new = FixtureTree.build([
+        .dir("Parent", [
+            .dir("Child", [.file("data", 2 * gb + 100 * mb)]),
+            .file("other", 1124 * mb),
+        ]),
+    ])
+    let insights = Outliers.fastGrowers(
+        tree: new,
+        previous: old,
+        homePath: home,
+        config: InsightsConfig()
+    )
+    let insight = try #require(insights.first)
+    #expect(insight.bytes == 3 * gb)
+    #expect(insight.nodeIDs.count == 2)
+    #expect(insight.children.first?.name == "Child")
+    #expect(insight.children.first?.bytes == 2 * gb)
+    #expect(insight.children.last?.name == "Parent")
+    #expect(insight.children.last?.bytes == 1 * gb)
+}
+
 @Test func fastGrowersNeedAPreviousScan() {
     let tree = FixtureTree.build([
         .dir("Projects", [.file("data", 5 * gb)]),
