@@ -32,6 +32,8 @@ public struct ScanStats: Sendable, Hashable, Codable {
     public var filesSeen: Int = 0
     public var hardLinksDeduplicated: Int = 0
     public var mountPointsSkipped: Int = 0
+    /// Paths of skipped mount points (capped; see scanner). Added in M1 (revision 1).
+    public var skippedMountPaths: [String] = []
     public var peakResidentBytes: UInt64 = 0
     public init() {}
 }
