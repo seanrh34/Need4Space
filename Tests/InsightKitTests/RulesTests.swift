@@ -371,7 +371,7 @@ private func containsInsight(_ insights: [Insight], _ id: String) -> Bool {
         ]),
     ])
     let insight = try #require(find(insights(tree), "vms"))
-    #expect(insight.bytes == 1500 * mb)
+    #expect(insight.bytes == 1 * gb + 500 * mb)
     #expect(insight.nodeIDs.count == 2)
 }
 
