@@ -255,7 +255,12 @@ enum DirectoryReader {
                 entry.name = name
             }
 
-            for (bit, width) in fileFieldLayout {
+            // Verified against a real kernel buffer (macOS 15, see RealBufferDiagnosticTests):
+            // directory records carry NO file-attribute slots even with FSOPT_PACK_INVAL_ATTRS,
+            // while non-directories carry every requested file slot. returnedFile == 0 means
+            // the section is absent.
+            let hasFileSection = returnedFile != 0 && entry.objType != Attr.ObjType.vdir
+            for (bit, width) in fileFieldLayout where hasFileSection {
                 guard offset + width <= recordEnd else { parsed = false; break }
                 let slot = offset
                 offset += width
@@ -271,7 +276,9 @@ enum DirectoryReader {
                     break
                 }
             }
-            guard parsed else { break }
+            // A record whose fields overrun its own declared length is skipped on its own;
+            // the length is already validated, so later records are still reachable.
+            guard parsed else { cursor = recordEnd; continue }
 
             entries.append(entry)
             cursor = recordEnd

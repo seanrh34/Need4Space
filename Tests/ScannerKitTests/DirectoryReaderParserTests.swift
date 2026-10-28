@@ -60,9 +60,11 @@ private func record(
     if accTime != nil { common |= Attr.cmnAccTime }
     if fileID != nil { common |= Attr.cmnFileID }
     if devid != nil { common |= Attr.cmnDevID }
-    if linkCount != nil { file |= Attr.fileLinkCount }
-    if alloc != nil { file |= Attr.fileAllocSize }
-    if logical != nil { file |= Attr.fileDataLength }
+    if objType != Attr.ObjType.vdir {
+        if linkCount != nil { file |= Attr.fileLinkCount }
+        if alloc != nil { file |= Attr.fileAllocSize }
+        if logical != nil { file |= Attr.fileDataLength }
+    }
 
     b.append(contentsOf: le32(common))
     b.append(contentsOf: le32(0)) // volattr
@@ -98,9 +100,12 @@ private func record(
         b.append(contentsOf: le64(UInt64(bitPattern: accTime ?? 0)))
         b.append(contentsOf: le64(accTime == nil ? 0 : 1))
         b.append(contentsOf: le64(fileID ?? 0))
-        b.append(contentsOf: le32(linkCount ?? 0))
-        b.append(contentsOf: le64(alloc ?? 0))
-        b.append(contentsOf: le64(logical ?? 0))
+        // Real kernels omit the whole file section for directories (see diagnostic test).
+        if objType != Attr.ObjType.vdir {
+            b.append(contentsOf: le32(linkCount ?? 0))
+            b.append(contentsOf: le64(alloc ?? 0))
+            b.append(contentsOf: le64(logical ?? 0))
+        }
     }
 
     if name != nil {
@@ -135,14 +140,14 @@ private func parse(_ records: [UInt8], count: Int? = nil) -> [RawEntry] {
 struct ParserTests {
     @Test func fullRecordParsesEveryField() {
         let buf = record(
-            name: "hello.txt", objType: Attr.ObjType.vdir, modTime: 1_700_000_000,
+            name: "hello.txt", objType: Attr.ObjType.vreg, modTime: 1_700_000_000,
             accTime: 1_700_000_001, fileID: 0x1234_5678_9ABC, devid: 0x1000_04,
             linkCount: 3, alloc: 4096, logical: 1234)
         let entries = parse(buf, count: 1)
         #expect(entries.count == 1)
         let e = entries[0]
         #expect(e.name.map { String(decoding: $0, as: UTF8.self) } == "hello.txt")
-        #expect(e.objType == Attr.ObjType.vdir)
+        #expect(e.objType == Attr.ObjType.vreg)
         #expect(e.modTime == 1_700_000_000)
         #expect(e.accessTime == 1_700_000_001)
         #expect(e.fileID == 0x1234_5678_9ABC)
@@ -224,6 +229,32 @@ struct ParserTests {
         #expect(entries[0].allocSize == 4096)
         #expect(entries[0].fileID == 9)
         #expect(entries[0].devid == 3)
+    }
+
+    /// Two records captured from a real macOS 15 kernel (dir "sub", 5000-byte "hello.txt").
+    @Test func parsesCapturedKernelBuffer() throws {
+        let hex = "58000000 0b1400a2 00000000 00000000 00000000 00000000 00000000 38000000 04000000 0e000001 02000000 532de26a 00000000 d7943726 00000000 532de26a 00000000 d7943726 00000000 ddb83500 00000000 73756200 " +
+            "78000000 0b1400a2 00000000 00000000 05020000 00000000 00000000 4c000000 0a000000 0e000001 01000000 532de26a 00000000 c09b3326 00000000 532de26a 00000000 003d3226 00000000 dcb83500 00000000 01000000 00200000 00000000 88130000 00000000 68656c6c 6f2e7478 74000000 00000000"
+        let compact = hex.replacingOccurrences(of: " ", with: "")
+        var bytes: [UInt8] = []
+        var idx = compact.startIndex
+        while idx < compact.endIndex {
+            let next = compact.index(idx, offsetBy: 2)
+            bytes.append(UInt8(compact[idx..<next], radix: 16)!)
+            idx = next
+        }
+        let entries = parse(bytes, count: 2)
+        try #require(entries.count == 2)
+        #expect(entries[0].name == Array("sub".utf8))
+        #expect(entries[0].objType == Attr.ObjType.vdir)
+        #expect(entries[0].error == nil)
+        #expect(entries[0].allocSize == nil)
+        #expect(entries[1].name == Array("hello.txt".utf8))
+        #expect(entries[1].objType == Attr.ObjType.vreg)
+        #expect(entries[1].linkCount == 1)
+        #expect(entries[1].allocSize == 8192)
+        #expect(entries[1].logicalSize == 5000)
+        #expect(entries[1].devid == 0x0100_000e)
     }
 
     @Test func perEntryErrorCarriesNameAndSkipsNothing() {
