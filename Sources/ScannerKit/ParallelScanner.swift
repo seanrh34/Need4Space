@@ -148,9 +148,11 @@ struct ScannerCore: Sendable {
     var continuation: CheckedContinuation<ScanResult, Error>?
     var streamContinuation: AsyncStream<ScanProgress>.Continuation?
     var progressTask: Task<Void, Never>?
-    /// Throttled snapshot cache (revision 4: at most 1 Hz).
+    /// Throttled snapshot cache (revision 4: at most 1 Hz), keyed by the pruning
+    /// parameters so different requests are not served a stale tree.
     var snapshotCache: ScanTree?
     var snapshotTime: ContinuousClock.Instant?
+    var snapshotKey: (maxDepth: Int, minFraction: Double)?
     /// Set when scan() starts; used for the elapsed statistic.
     var startedAt: ContinuousClock.Instant?
 
@@ -322,8 +324,9 @@ extension ParallelScanner {
     public func snapshotTree(maxDepth: Int = 4, minFraction: Double = 0.001) -> ScanTree {
         core.withLock { core -> ScanTree in
             let now = ContinuousClock.now
-            if let cached = core.snapshotCache, let last = core.snapshotTime,
-                last.duration(to: now) < .seconds(1)
+            let key = (maxDepth, minFraction)
+            if let cached = core.snapshotCache, core.snapshotKey == key,
+                let last = core.snapshotTime, last.duration(to: now) < .seconds(1)
             {
                 return cached
             }
@@ -331,6 +334,7 @@ extension ParallelScanner {
                 core.builder.tree, maxDepth: maxDepth, minFraction: minFraction)
             core.snapshotCache = snap
             core.snapshotTime = now
+            core.snapshotKey = key
             return snap
         }
     }
