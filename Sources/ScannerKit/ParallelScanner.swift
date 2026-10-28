@@ -208,7 +208,7 @@ public final class ParallelScanner: Sendable {
         let builder = BuilderState(rootPath: options.root, reserveCapacity: options.reserveCapacity)
         var continuation: AsyncStream<ScanProgress>.Continuation?
         // The build closure runs synchronously during init (AsyncStream documentation).
-        let stream = AsyncStream(ScanProgress.self, bufferingPolicy: .bufferingNewest) {
+        let stream = AsyncStream(ScanProgress.self, bufferingPolicy: .bufferingNewest(8)) {
             continuation = $0
         }
         self.progressStream = stream
@@ -325,7 +325,7 @@ extension ParallelScanner {
         core.withLock { core -> ScanTree in
             let now = ContinuousClock.now
             let key = (maxDepth, minFraction)
-            if let cached = core.snapshotCache, core.snapshotKey == key,
+            if let cached = core.snapshotCache, let cachedKey = core.snapshotKey, cachedKey.maxDepth == key.0, cachedKey.minFraction == key.1,
                 let last = core.snapshotTime, last.duration(to: now) < .seconds(1)
             {
                 return cached
@@ -391,7 +391,7 @@ extension ParallelScanner {
 
     private struct DeliveryPayload: Sendable {
         var continuation: CheckedContinuation<ScanResult, Error>?
-        var stream: AsyncStream<ScanProgress>.Continuation
+        var stream: AsyncStream<ScanProgress>.Continuation?
         var progressTask: Task<Void, Never>?
         var result: ScanResult?
     }
@@ -431,7 +431,7 @@ extension ParallelScanner {
 
     private func deliver(_ payload: DeliveryPayload) {
         payload.progressTask?.cancel()
-        payload.stream.finish()
+        payload.stream?.finish()
         if let result = payload.result {
             payload.continuation?.resume(returning: result)
         } else {
@@ -558,7 +558,9 @@ extension ParallelScanner {
                 var nameBytes = name
                 nameBytes.append(0)
                 let childFD = nameBytes.withUnsafeBufferPointer { bytes -> Int32 in
-                    openat(job.fd, bytes.baseAddress!, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                    bytes.baseAddress!.withMemoryRebound(to: CChar.self, capacity: bytes.count) {
+                        openat(job.fd, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                    }
                 }
                 #else
                 let childFD: Int32 = -1
@@ -882,7 +884,9 @@ extension ParallelScanner {
                         var nameBytes = name
                         nameBytes.append(0)
                         let childFD = nameBytes.withUnsafeBufferPointer { bytes -> Int32 in
-                            openat(fd, bytes.baseAddress!, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                            bytes.baseAddress!.withMemoryRebound(to: CChar.self, capacity: bytes.count) {
+                                openat(fd, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                            }
                         }
                         if childFD >= 0 { stack.append(childFD) }
                     case Attr.ObjType.vreg:
