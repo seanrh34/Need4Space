@@ -602,7 +602,7 @@ struct MemoryBudgetTests {
             let dir = child(root, String(format: "d%03d", d))
             try makeDir(dir)
             for f in 0..<filesPerDir {
-                try writeFile(child(dir, String(format: "f%04d", f)), 0)
+                try writeFile(dir + "/" + String(format: "f%04d", f), 0)
             }
         }
 
