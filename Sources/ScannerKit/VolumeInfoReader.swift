@@ -25,7 +25,7 @@ public enum VolumeInfoReader {
         }
         guard let total = values.volumeTotalCapacity, let available = values.volumeAvailableCapacity
         else { return nil }
-        let importantUsage = values.volumeAvailableCapacityForImportantUsage ?? available
+        let importantUsage = values.volumeAvailableCapacityForImportantUsage ?? Int64(available)
         let used = max(0, Int64(total) - Int64(available))
         let purgeable = max(0, Int64(importantUsage) - Int64(available))
         return VolumeInfo(
