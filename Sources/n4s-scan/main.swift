@@ -90,9 +90,9 @@ let progressTask = Task {
         let second = Int(p.elapsedSeconds)
         guard second != lastSecond else { continue }
         lastSecond = second
-        let line = String(
-            format: "\r%6.1fs  %8d dirs  %9d files  %@",
-            p.elapsedSeconds, p.directoriesScanned, p.filesFound, humanBytes(p.bytesFound))
+        let seconds = String(format: "%6.1f", p.elapsedSeconds)
+        let line = "\r\(seconds)s  \(p.directoriesScanned) dirs  \(p.filesFound) files  "
+            + humanBytes(p.bytesFound)
         stderrWrite(line)
     }
     stderrWrite("\n")
@@ -190,10 +190,7 @@ if json {
     if !topFolders.isEmpty {
         print("top \(topFolders.count) folders (depth 1...4, by allocated size):")
         for (rank, folder) in topFolders.enumerated() {
-            print(
-                String(
-                    format: "  %2d. %@  (%d files)",
-                    rank + 1, folder.path, folder.files))
+            print("  \(rank + 1). \(folder.path)  (\(folder.files) files)")
         }
     }
 }
