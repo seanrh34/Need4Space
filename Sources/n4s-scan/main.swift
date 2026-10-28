@@ -138,7 +138,7 @@ if tree.count > 0 {
     // of its parent's bytes (collapses X.app -> X.app/Contents chains). Only applied
     // from depth 2 on so the root's direct children always stay visible.
     let scannedTotal = max(result.scannedTotalBytes, 1)
-    let filtered = candidates.filter { row in
+    var filtered = candidates.filter { row in
         guard row.depth >= 2 else { return true }
         let parentID = Int(tree.parent[row.id])
         guard parentID >= 0 else { return true }
