@@ -256,8 +256,14 @@ struct FixtureScanTests2 {
         let node = try #require(tree.node(atPath: path))
         let st = try statOf(path)
         #expect(tree.allocSize[Int(node)] == st.blocks * 512)
-        #expect(tree.logicalSize[Int(node)] == 8_000_000)
-        #expect(tree.allocSize[Int(node)] < tree.logicalSize[Int(node)])
+        // pwrite at 7_996_000 + 4096 extends the file to 8_000_096 bytes.
+        #expect(tree.logicalSize[Int(node)] == st.size)
+        #expect(st.size == 8_000_096)
+        // Whether the hole stays unallocated depends on the volume (CI disk images may fill
+        // it); the scanner must report whatever the filesystem allocated, which is checked above.
+        if st.blocks * 512 < st.size {
+            #expect(tree.allocSize[Int(node)] < tree.logicalSize[Int(node)])
+        }
         #expect(result.scannedTotalBytes == st.blocks * 512)
     }
 
@@ -353,7 +359,7 @@ struct FixtureScanTests2 {
             try makeDir(next)
             dir = next
         }
-        try writeFile(dir + "/bottom.bin", 10_000)
+        try writeFile(dir + "/bottom.bin", 100_000) // >= 64 KB so it is not grouped
         let bottomAlloc = try allocOf(dir + "/bottom.bin")
 
         let result = try await runScan(root, threads: 8)
@@ -526,7 +532,7 @@ struct ReviewFixTests {
         try makeDir(child(root, "FOO.APP", "Contents"))
         try writeFile(child(root, "TINY.ZIP"), 1_000)
         try writeFile(child(root, "small.dat"), 1_000)
-        try writeFile(child(root, "FOO.APP", "Contents", "exec"), 2_000)
+        try writeFile(child(root, "FOO.APP", "Contents", "exec"), 100_000) // not grouped
 
         let result = try await runScan(root)
         let tree = result.tree
