@@ -21,7 +21,7 @@ jobs:
       - name: Build (debug)
         run: swift build
       - name: Test
-        run: swift test
+        run: swift test --no-parallel
       - name: Build (release)
         run: swift build -c release
       - name: Scanner benchmark smoke run
