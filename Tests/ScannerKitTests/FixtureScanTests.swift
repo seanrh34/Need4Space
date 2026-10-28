@@ -578,7 +578,7 @@ struct ReviewFixTests {
         try FileManager.default.createSymbolicLink(
             atPath: child(root, "loopA"), withDestinationPath: "loopB")
 
-        let totals = ParallelScanner.scanDirectorySequentially(path: root.path)
+        let totals = ParallelScanner.scanDirectorySequentially(path: root.path) { false }
         let expected = try expectedTotals(root.path)
         #expect(totals != nil)
         #expect(totals?.alloc == expected.alloc)

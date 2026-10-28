@@ -976,14 +976,12 @@ extension ParallelScanner {
         builder.hardLinks.removeAll(keepingCapacity: false)
     }
 
-    /// Revision 2: /private/var/vm (firmlinked to the VM volume) is measured recursively
-    /// as an explicit exception and attached under /private/var with its completed total.
-    /// Called from assembleResult, outside the core lock (review round 2 fix 6).
-
-    /// Attaches a completed subtree as one directory node under an existing path. The
-    /// node starts at zero and receives its totals exactly once via addBytes, which also
-    /// pushes them up the ancestors (review fix F: the old code set the sizes on append
-    /// AND added them again). Internal so tests can pin the single-count behavior.
+    /// Attaches a completed subtree (e.g. the /private/var/vm walk, called from
+    /// assembleResult outside the core lock) as one directory node under an existing
+    /// path. The node starts at zero and receives its totals exactly once via addBytes,
+    /// which also pushes them up the ancestors (review fix F: the old code set the sizes
+    /// on append AND added them again). Internal so tests can pin the single-count
+    /// behavior.
     static func attachSubtree(
         _ b: inout BuilderState, underPath: String, name: String,
         alloc: UInt64, logical: UInt64, files: Int
