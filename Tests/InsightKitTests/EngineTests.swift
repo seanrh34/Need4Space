@@ -79,7 +79,7 @@ private let gb = Size.gb
     ])
     let report = InsightEngine().run(tree: tree, homePath: home)
     #expect(report.hidden.gapBytes == 0)
-    #expect(report.insights.contains(where: { $0.id.hasPrefix("hidden.space:") } == false))
+    #expect(report.insights.contains(where: { $0.id.hasPrefix("hidden.space:") }) == false)
     #expect(report.reclaimableSafeBytes == 300 * mb)
 }
 
