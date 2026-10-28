@@ -36,11 +36,11 @@ private func statOf(_ path: String) throws -> StatInfo {
     // S_IFMT/S_IFDIR/S_IFREG are mode_t (UInt16) on Darwin; st_mtimespec.tv_sec is the
     // seconds field (stat has no st_mtime member in Swift).
     return StatInfo(
-        dev: st.st_dev, ino: st.st_ino, nlink: st.st_nlink,
+        dev: st.st_dev, ino: st.st_ino, nlink: UInt64(st.st_nlink),
         blocks: UInt64(st.st_blocks), size: UInt64(st.st_size),
         isDir: st.st_mode & S_IFMT == S_IFDIR,
         isRegular: st.st_mode & S_IFMT == S_IFREG,
-        mtime: st.st_mtimespec.tv_sec)
+        mtime: Int64(st.st_mtimespec.tv_sec))
 }
 
 private func allocOf(_ path: String) throws -> UInt64 {
