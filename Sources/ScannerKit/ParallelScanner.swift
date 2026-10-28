@@ -113,6 +113,8 @@ struct BuilderState: Sendable {
     }
     var inFlight: [NodeID: DirState] = [:]
     var blockedIDs: [NodeID] = []
+    /// Non-permission failures to read a directory (review round 2 fix 7).
+    var incompleteDirs: [IncompleteDir] = []
     var hardLinks: [HardLinkRecord] = []
     var deduplicatedLinks: Int = 0
     var mountSkipCount: Int = 0
@@ -463,11 +465,16 @@ extension ParallelScanner {
         var continuation: CheckedContinuation<ScanResult, Error>?
         var stream: AsyncStream<ScanProgress>.Continuation?
         var progressTask: Task<Void, Never>?
-        var result: ScanResult?
+        /// Moved out of the core under the lock when the scan completed normally;
+        /// nil when the delivery is a cancellation.
+        var builder: BuilderState?
+        var startedAt: ContinuousClock.Instant?
     }
 
     /// Must be called with the core lock held. Claims the single delivery right and
-    /// extracts everything needed to finish the scan outside the lock.
+    /// moves the builder out so the (blocking) result assembly can run WITHOUT the
+    /// core lock — the progress stream is finished and the workers are done at this
+    /// point, so nothing else touches the tree (review round 2 fix 6).
     private func completeScanLocked(
         _ core: inout ScannerCore, cancelled: Bool
     ) -> DeliveryPayload? {
@@ -479,28 +486,91 @@ extension ParallelScanner {
         core.streamContinuation = nil
         let progressTask = core.progressTask
         core.progressTask = nil
+        // Release the live snapshot cache; queues hold node IDs only (no fds).
+        core.snapshotCache = nil
+        core.snapshotKey = nil
+        core.snapshotTime = nil
+        core.queues = Array(repeating: [], count: core.queues.count)
         if cancelled {
-            // Jobs carry no fds (they open by path when they run), so cancelling can
-            // never leak queued descriptors; just drop the queued work.
-            core.queues = Array(repeating: [], count: core.queues.count)
+            core.builder.pendingDirs = 0
             return DeliveryPayload(
                 continuation: continuation, stream: stream, progressTask: progressTask,
-                result: nil)
+                builder: nil, startedAt: nil)
         }
-        let result = buildResultLocked(&core)
+        var builder = core.builder
+        // Leave an empty stub behind: workers have exited and the stream is finished,
+        // but the progress snapshot path must still see a consistent (empty) builder.
+        core.builder = BuilderState(rootPath: options.root, reserveCapacity: 0)
+        core.builder.pendingDirs = 0
+        let startedAt = core.startedAt
         return DeliveryPayload(
             continuation: continuation, stream: stream, progressTask: progressTask,
-            result: result)
+            builder: builder, startedAt: startedAt)
     }
 
     private func deliver(_ payload: DeliveryPayload) {
         payload.progressTask?.cancel()
         payload.stream?.finish()
-        if let result = payload.result {
-            payload.continuation?.resume(returning: result)
-        } else {
-            payload.continuation?.resume(throwing: CancellationError())
+        guard let continuation = payload.continuation else { return }
+        guard var builder = payload.builder else {
+            continuation.resume(throwing: CancellationError())
+            return
         }
+        // Result assembly (hard links, /private/var/vm walk, tmutil) runs on the
+        // delivering worker with no locks held; a cancelled scan throws instead of
+        // returning a result (review round 2 fix 6).
+        if let result = assembleResult(builder: &builder, startedAt: payload.startedAt) {
+            continuation.resume(returning: result)
+        } else {
+            continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    /// Builds the final ScanResult from the detached builder. Blocking work (the
+    /// /private/var/vm walk, the tmutil subprocess) runs here, outside the core lock.
+    /// Returns nil when cancellation was observed (review round 2 fix 6).
+    private func assembleResult(
+        builder: inout BuilderState, startedAt: ContinuousClock.Instant?
+    ) -> ScanResult? {
+        if cancelFlag.load(ordering: .acquiring) { return nil }
+
+        resolveHardLinks(builder: &builder)
+
+        if varVMRequested.load(ordering: .relaxed) {
+            let totals = Self.scanDirectorySequentially(
+                path: "/private/var/vm") { [self] in cancelFlag.load(ordering: .relaxed) }
+            if let totals {
+                if let vmID = Self.attachSubtree(
+                    &builder, underPath: "/private/var", name: "vm",
+                    alloc: totals.alloc, logical: totals.logical, files: totals.files),
+                    totals.firstErrno != 0
+                {
+                    builder.incompleteDirs.append(
+                        IncompleteDir(nodeID: vmID, errno: totals.firstErrno))
+                }
+            }
+            if cancelFlag.load(ordering: .relaxed) { return nil }
+        }
+        if cancelFlag.load(ordering: .acquiring) { return nil }
+
+        var stats = ScanStats()
+        if let startedAt {
+            let duration = startedAt.duration(to: ContinuousClock.now)
+            stats.elapsedSeconds = Double(duration.components.seconds)
+                + Double(duration.components.attoseconds) * 1e-18
+        }
+        stats.directoriesScanned = Int(dirsScanned.load(ordering: .relaxed))
+        stats.filesSeen = builder.tree.count > 0 ? Int(builder.tree.fileCount[0]) : 0
+        stats.hardLinksDeduplicated = builder.deduplicatedLinks
+        stats.mountPointsSkipped = builder.mountSkipCount
+        stats.skippedMountPaths = builder.skippedMountPaths
+        stats.peakResidentBytes = MemoryInfo.peakResidentBytes()
+
+        let volume = options.measureVolumeInfo ? VolumeInfoReader.read(mountPath: options.root) : nil
+        return ScanResult(
+            tree: builder.tree, blocked: builder.blockedIDs, volume: volume,
+            scannedAt: Date(), stats: stats, lastEventID: nil,
+            incomplete: builder.incompleteDirs)
     }
 }
 
@@ -560,7 +630,8 @@ extension ParallelScanner {
             }
             // No work anywhere: normal completion iff nothing pending and nothing active.
             if core.builder.pendingDirs == 0, core.activeJobs == 0 {
-                return .exit(completeScanLocked(&core, cancelled: false))
+                return .exit(completeScanLocked(
+                    &core, cancelled: cancelFlag.load(ordering: .relaxed)))
             }
             return .wait
         }
@@ -653,15 +724,18 @@ extension ParallelScanner {
     }
 
     /// A queued directory could not be listed (open or getattrlistbulk failure).
-    /// Permission errors become blocked nodes; every other error leaves a zero-size
-    /// directory node. Either way the job's final step marks listingDone and finalizes,
-    /// so the completion protocol never wedges (review fixes B/C).
+    /// Permission errors become blocked nodes; every other error keeps the children
+    /// read so far in a zero-size directory and marks it incomplete. Either way the
+    /// job's final step marks listingDone and finalizes, so the completion protocol
+    /// never wedges (review fixes B/C, round 2 fix 7).
     private func markDirFailureLocked(_ job: DirJob, errno: Int32) {
         core.withLock { core in
             let i = Int(job.nodeID)
             if errno == EPERM || errno == EACCES {
                 core.builder.tree.kind[i] = .blocked
                 core.builder.blockedIDs.append(job.nodeID)
+            } else {
+                core.builder.incompleteDirs.append(IncompleteDir(nodeID: job.nodeID, errno: errno))
             }
         }
     }
@@ -861,15 +935,16 @@ extension ParallelScanner {
     /// round 2 fix 3): one running owner is kept per key, and paths are built only for
     /// keys seen more than once. For records attached to a smallFilesGroup node the
     /// comparison key is the group's node path — deterministic and stable across runs
-    /// (group paths are prefixes of the member file paths).
-    private func resolveHardLinksLocked(_ core: inout ScannerCore) {
+    /// (group paths are prefixes of the member file paths). Runs on the detached builder
+    /// during result assembly, outside the core lock (review round 2 fix 6).
+    static func resolveHardLinks(builder: inout BuilderState) {
         struct KeyState {
             var count = 0
             var best: HardLinkRecord?
             var bestPath: String?
         }
         var groups: [DeviceFileKey: KeyState] = [:]
-        for record in core.builder.hardLinks {
+        for record in builder.hardLinks {
             let key = DeviceFileKey(devid: record.devid, fileID: record.fileID)
             var state = groups[key] ?? KeyState()
             state.count += 1
@@ -877,9 +952,9 @@ extension ParallelScanner {
                 state.best = record
             } else {
                 if state.bestPath == nil, let best = state.best {
-                    state.bestPath = core.builder.tree.path(best.nodeID)
+                    state.bestPath = builder.tree.path(best.nodeID)
                 }
-                let path = core.builder.tree.path(record.nodeID)
+                let path = builder.tree.path(record.nodeID)
                 if let bestPath = state.bestPath, path < bestPath {
                     state.best = record
                     state.bestPath = path
@@ -889,25 +964,19 @@ extension ParallelScanner {
         }
         for state in groups.values {
             if state.count > 1 {
-                core.builder.deduplicatedLinks += state.count - 1
+                builder.deduplicatedLinks += state.count - 1
             }
             guard let best = state.best else { continue }
-            Self.addBytes(
-                &core.builder.tree, nodeID: best.nodeID,
+            addBytes(
+                &builder.tree, nodeID: best.nodeID,
                 alloc: best.alloc, logical: best.logical)
         }
-        core.builder.hardLinks.removeAll(keepingCapacity: false)
+        builder.hardLinks.removeAll(keepingCapacity: false)
     }
 
     /// Revision 2: /private/var/vm (firmlinked to the VM volume) is measured recursively
     /// as an explicit exception and attached under /private/var with its completed total.
-    private func attachVarVMLocked(_ core: inout ScannerCore) {
-        guard varVMRequested.load(ordering: .relaxed) else { return }
-        guard let totals = Self.scanDirectorySequentially(path: "/private/var/vm") else { return }
-        _ = Self.attachSubtree(
-            &core.builder, underPath: "/private/var", name: "vm",
-            alloc: totals.alloc, logical: totals.logical, files: totals.files)
-    }
+    /// Called from assembleResult, outside the core lock (review round 2 fix 6).
 
     /// Attaches a completed subtree as one directory node under an existing path. The
     /// node starts at zero and receives its totals exactly once via addBytes, which also
@@ -924,33 +993,49 @@ extension ParallelScanner {
         return id
     }
 
-    /// Sequential (single-threaded) recursive measurement used only for the small
-    /// /private/var/vm exception. Ignores devid boundaries on purpose; deduplicates
-    /// hard links within the subtree.
-    static func scanDirectorySequentially(path: String) -> (alloc: UInt64, logical: UInt64, files: Int)? {
+    /// Sequential single-threaded measurement used only for the small /private/var/vm
+    /// exception. Depth-first over PATHS: each directory is closed before any sibling is
+    /// opened, so at most one fd is open (review round 2 fix 5). Failed opens/listings
+    /// are reported via `firstErrno` (0 = complete) instead of silently dropping bytes.
+    /// Ignores devid boundaries on purpose; deduplicates hard links within the subtree.
+    /// `isCancelled` is checked between directories and batches.
+    static func scanDirectorySequentially(
+        path: String, isCancelled: () -> Bool
+    ) -> (alloc: UInt64, logical: UInt64, files: Int, firstErrno: Int32)? {
         #if canImport(Darwin)
-        let rootFD = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard rootFD >= 0 else { return nil }
-        var stack: [Int32] = [rootFD]
-        defer {
-            while let fd = stack.popLast() {
-                _ = close(fd)
-            }
-        }
         let buffer = UnsafeMutableRawPointer.allocate(
             byteCount: DirectoryReader.defaultBufferBytes, alignment: 64)
         defer { buffer.deallocate() }
 
+        var stack: [String] = [path]
         var seenLinked = Set<DeviceFileKey>()
         var alloc: UInt64 = 0
         var logical: UInt64 = 0
         var files = 0
+        var firstErrno: Int32 = 0
 
-        while let fd = stack.popLast() {
+        while let dirPath = stack.popLast() {
+            if isCancelled() {
+                if firstErrno == 0 { firstErrno = ECANCELED }
+                break
+            }
+            let fd = open(dirPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            if fd < 0 {
+                if firstErrno == 0 { firstErrno = errno }
+                continue
+            }
             while true {
+                if isCancelled() {
+                    if firstErrno == 0 { firstErrno = ECANCELED }
+                    break
+                }
                 let n = DirectoryReader.readEntries(
                     fd: fd, buffer: buffer, bufferSize: DirectoryReader.defaultBufferBytes)
-                if n <= 0 { break }
+                if n < 0 {
+                    if firstErrno == 0 { firstErrno = errno }
+                    break
+                }
+                if n == 0 { break }
                 let entries = DirectoryReader.parseAttrBuffer(
                     UnsafeRawBufferPointer(start: buffer, count: DirectoryReader.defaultBufferBytes),
                     count: n)
@@ -959,14 +1044,7 @@ extension ParallelScanner {
                     switch entry.objType {
                     case Attr.ObjType.vdir:
                         guard let name = entry.name else { continue }
-                        var nameBytes = name
-                        nameBytes.append(0)
-                        let childFD = nameBytes.withUnsafeBufferPointer { bytes -> Int32 in
-                            bytes.baseAddress!.withMemoryRebound(to: CChar.self, capacity: bytes.count) {
-                                openat(fd, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                            }
-                        }
-                        if childFD >= 0 { stack.append(childFD) }
+                        stack.append(Self.childPath(parent: dirPath, name: name))
                     case Attr.ObjType.vreg:
                         let entryAlloc = entry.allocSize ?? entry.logicalSize ?? 0
                         let entryLogical = entry.logicalSize ?? 0
@@ -983,43 +1061,17 @@ extension ParallelScanner {
                     }
                 }
             }
+            // The directory is closed before any sibling (or child) is opened.
             _ = close(fd)
         }
-        return (alloc, logical, files)
+        return (alloc, logical, files, firstErrno)
         #else
         return nil
         #endif
     }
 
-    // MARK: Result assembly
+    // MARK: Snapshots
 
-    private func buildResultLocked(_ core: inout ScannerCore) -> ScanResult {
-        resolveHardLinksLocked(&core)
-        attachVarVMLocked(&core)
-        // The scan is over: drop the cached snapshot so a finished scanner does not pin
-        // a second copy of the tree (review round 2 fix 4).
-        core.snapshotCache = nil
-        core.snapshotKey = nil
-        core.snapshotTime = nil
-
-        var stats = ScanStats()
-        if let startedAt = core.startedAt {
-            let duration = startedAt.duration(to: ContinuousClock.now)
-            stats.elapsedSeconds = Double(duration.components.seconds)
-                + Double(duration.components.attoseconds) * 1e-18
-        }
-        stats.directoriesScanned = Int(dirsScanned.load(ordering: .relaxed))
-        stats.filesSeen = core.builder.tree.count > 0 ? Int(core.builder.tree.fileCount[0]) : 0
-        stats.hardLinksDeduplicated = core.builder.deduplicatedLinks
-        stats.mountPointsSkipped = core.builder.mountSkipCount
-        stats.skippedMountPaths = core.builder.skippedMountPaths
-        stats.peakResidentBytes = MemoryInfo.peakResidentBytes()
-
-        let volume = options.measureVolumeInfo ? VolumeInfoReader.read(mountPath: options.root) : nil
-        return ScanResult(
-            tree: core.builder.tree, blocked: core.builder.blockedIDs, volume: volume,
-            scannedAt: Date(), stats: stats, lastEventID: nil)
-    }
     /// Pruned copy for live UI snapshots (revision 4): nodes down to `maxDepth` whose
     /// subtree allocated size is at least `minFraction` of the root total. Kept nodes
     /// carry their true (current) totals, so a parent's size covers pruned children.

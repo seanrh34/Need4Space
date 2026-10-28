@@ -13,6 +13,8 @@ struct TopFolderReport: Codable {
     var files: UInt32
 }
 
+var topFolderPcts: [Double] = []
+
 struct VolumeReport: Codable {
     var mountPath: String
     var totalBytes: UInt64
@@ -35,6 +37,8 @@ struct ScanReport: Codable {
     var skippedMountPaths: [String]
     var blockedCount: Int
     var blockedPaths: [String]
+    var incompleteCount: Int
+    var incompletePaths: [String]
     var peakResidentBytes: UInt64
     var topFolders: [TopFolderReport]
     var volume: VolumeReport?
@@ -118,23 +122,34 @@ let tree = result.tree
 var directories = 0
 var topFolders: [TopFolderReport] = []
 if tree.count > 0 {
+    var candidates: [(id: Int, path: String, bytes: UInt64, files: UInt32, depth: Int)] = []
     for id in 0..<tree.count {
         let kind = tree.kind[id]
         if kind == .directory || kind == .bundle {
             directories += 1
             let depth = tree.depth(NodeID(id))
             if depth >= 1, depth <= 4 {
-                topFolders.append(
-                    TopFolderReport(
-                        path: tree.path(NodeID(id)), bytes: tree.allocSize[id],
-                        files: tree.fileCount[id]))
+                candidates.append(
+                    (id, tree.path(NodeID(id)), tree.allocSize[id], tree.fileCount[id], depth))
             }
         }
     }
-    topFolders.sort { $0.bytes > $1.bytes }
-    if topFolders.count > top {
-        topFolders.removeLast(topFolders.count - top)
+    // Review round 2 fix 8: keep the parent, skip the child when the child holds >= 95%
+    // of its parent's bytes (collapses X.app -> X.app/Contents chains). Only applied
+    // from depth 2 on so the root's direct children always stay visible.
+    let scannedTotal = max(result.scannedTotalBytes, 1)
+    let filtered = candidates.filter { row in
+        guard row.depth >= 2 else { return true }
+        let parentID = Int(tree.parent[row.id])
+        guard parentID >= 0 else { return true }
+        let parentAlloc = tree.allocSize[parentID]
+        return Double(row.bytes) < 0.95 * Double(max(parentAlloc, 1))
     }
+    filtered.sort { $0.bytes > $1.bytes }
+    topFolders = filtered.prefix(top).map {
+        TopFolderReport(path: $0.path, bytes: $0.bytes, files: $0.files)
+    }
+    topFolderPcts = filtered.prefix(top).map { Double($0.bytes) * 100.0 / Double(scannedTotal) }
 }
 
 let volume: VolumeReport? = result.volume.map {
@@ -156,6 +171,8 @@ let report = ScanReport(
     skippedMountPaths: result.stats.skippedMountPaths,
     blockedCount: result.blocked.count,
     blockedPaths: result.blocked.prefix(50).map { tree.path($0) },
+    incompleteCount: result.incomplete.count,
+    incompletePaths: result.incomplete.prefix(20).map { tree.path($0.nodeID) },
     peakResidentBytes: result.stats.peakResidentBytes,
     topFolders: topFolders,
     volume: volume)
@@ -174,6 +191,7 @@ if json {
         "hard links deduped \(report.hardLinksDeduplicated)" +
         "  mount points skipped \(report.mountPointsSkipped)" +
         "  blocked \(report.blockedCount)" +
+        "  incomplete \(report.incompleteCount)" +
         "  peak RSS \(humanBytes(report.peakResidentBytes))")
     if let v = volume {
         print(
@@ -187,10 +205,18 @@ if json {
             print("  \(p)")
         }
     }
+    if !report.incompletePaths.isEmpty {
+        print("incomplete directories (first \(report.incompletePaths.count)):")
+        for p in report.incompletePaths {
+            print("  \(p)")
+        }
+    }
     if !topFolders.isEmpty {
-        print("top \(topFolders.count) folders (depth 1...4, by allocated size):")
+        print("top \(topFolders.count) folders (depth 1...4, allocated size, % of scanned total):")
         for (rank, folder) in topFolders.enumerated() {
-            print("  \(rank + 1). \(folder.path)  (\(folder.files) files)")
+            let pct = rank < topFolderPcts.count
+                ? String(format: "%.1f%%", topFolderPcts[rank]) : "n/a"
+            print("  \(rank + 1). \(folder.path) — \(humanBytes(folder.bytes)) (\(pct), \(folder.files) files)")
         }
     }
 }
