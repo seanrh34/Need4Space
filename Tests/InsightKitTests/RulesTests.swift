@@ -69,7 +69,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             ]),
         ]),
     ])
-    #expect(insights(tree).contains { $0.id == "xcode.derivedData" } == false)
+    #expect(insights(tree).contains(where: { $0.id == "xcode.derivedData" }) == false)
 }
 
 @Test func exactMinimumIsShown() {
@@ -82,7 +82,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             ]),
         ]),
     ])
-    #expect(insights(tree).contains { $0.id == "xcode.derivedData" })
+    #expect(insights(tree).contains(where: { $0.id == "xcode.derivedData" }))
 }
 
 @Test func absolutePatternMatchesOutsideHome() throws {
@@ -94,7 +94,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
     ])
     let insight = try #require(insights(tree).first { $0.id == "logs" })
     #expect(insight.bytes == 300 * mb)
-    #expect(insight.paths.contains { $0.path == "/Library/Logs" })
+    #expect(insight.paths.contains(where: { $0.path == "/Library/Logs" }))
 }
 
 @Test func perSubfolderChildrenAreAggregated() throws {
@@ -156,7 +156,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             .dir("app", [.dir("node_modules", [.file("package", 150 * mb)])]),
         ]),
     ])
-    #expect(insights(tree).contains { $0.id == "developer.buildOutputs" } == false)
+    #expect(insights(tree).contains(where: { $0.id == "developer.buildOutputs" }) == false)
 }
 
 @Test func downloadsSpecialRuleMatchesLargeFilesAndInstallers() throws {

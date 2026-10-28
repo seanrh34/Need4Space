@@ -60,8 +60,8 @@ private let gb = Size.gb
     #expect(ids.contains("xcode.derivedData"))
     #expect(ids.contains("userCaches"))
     #expect(ids.contains("hidden.space"))
-    #expect(ids.contains { $0.hasPrefix("largeFolder.") })
-    #expect(ids.contains { $0.hasPrefix("staleFile.") })
+    #expect(ids.contains(where: { $0.hasPrefix("largeFolder.") }))
+    #expect(ids.contains(where: { $0.hasPrefix("staleFile.") }))
 
     #expect(report.reclaimableSafeBytes == 850 * mb)
     #expect(report.hidden.gapBytes > 0)
@@ -80,7 +80,7 @@ private let gb = Size.gb
     ])
     let report = InsightEngine().run(tree: tree, homePath: home)
     #expect(report.hidden.gapBytes == 0)
-    #expect(report.insights.contains { $0.id == "hidden.space" } == false)
+    #expect(report.insights.contains(where: { $0.id == "hidden.space" }) == false)
     #expect(report.reclaimableSafeBytes == 300 * mb)
 }
 

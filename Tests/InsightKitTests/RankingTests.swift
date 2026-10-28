@@ -25,7 +25,7 @@ private func makeInsight(_ id: String, bytes: UInt64, risk: Risk) -> Insight {
         makeInsight("large", bytes: 100 * mb, risk: .careful),
         makeInsight("medium", bytes: 50 * mb, risk: .review),
     ])
-    #expect(ranked.map(\.id) == ["large", "medium", "small"])
+    #expect(ranked.map { $0.id } == ["large", "medium", "small"])
 }
 
 @Test func rankingPromotesSafeChainThroughSeveralUnsafeItems() {
@@ -35,7 +35,7 @@ private func makeInsight(_ id: String, bytes: UInt64, risk: Risk) -> Insight {
         makeInsight("safe-90", bytes: 90 * mb, risk: .safe),
         makeInsight("safe-85", bytes: 85 * mb, risk: .safe),
     ])
-    #expect(ranked.map(\.id) == ["safe-95", "safe-90", "safe-85", "unsafe-100"])
+    #expect(ranked.map { $0.id } == ["safe-95", "safe-90", "safe-85", "unsafe-100"])
 }
 
 @Test func rankingDoesNotPromoteItemsOutsideTwentyPercent() {
@@ -43,7 +43,7 @@ private func makeInsight(_ id: String, bytes: UInt64, risk: Risk) -> Insight {
         makeInsight("unsafe-100", bytes: 100 * mb, risk: .careful),
         makeInsight("safe-60", bytes: 60 * mb, risk: .safe),
     ])
-    #expect(ranked.map(\.id) == ["unsafe-100", "safe-60"])
+    #expect(ranked.map { $0.id } == ["unsafe-100", "safe-60"])
 }
 
 @Test func rankingPromotesWhenSizesAreExactlyWithinTwentyPercent() {
@@ -51,7 +51,7 @@ private func makeInsight(_ id: String, bytes: UInt64, risk: Risk) -> Insight {
         makeInsight("unsafe-100", bytes: 100 * mb, risk: .review),
         makeInsight("safe-80", bytes: 80 * mb, risk: .safe),
     ])
-    #expect(ranked.map(\.id) == ["safe-80", "unsafe-100"])
+    #expect(ranked.map { $0.id } == ["safe-80", "unsafe-100"])
 }
 
 @Test func rankingLeavesSafeItemsAlone() {
@@ -60,5 +60,5 @@ private func makeInsight(_ id: String, bytes: UInt64, risk: Risk) -> Insight {
         makeInsight("review-90", bytes: 90 * mb, risk: .review),
         makeInsight("safe-70", bytes: 70 * mb, risk: .safe),
     ])
-    #expect(ranked.map(\.id) == ["safe-100", "review-90", "safe-70"])
+    #expect(ranked.map { $0.id } == ["safe-100", "review-90", "safe-70"])
 }

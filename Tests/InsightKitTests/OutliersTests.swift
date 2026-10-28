@@ -50,8 +50,8 @@ private let gb = Size.gb
         homePath: home,
         config: InsightsConfig()
     )
-    #expect(insights.contains { $0.paths.first?.path == home + "/Library" } == false)
-    #expect(insights.contains { $0.title == "Large folder: SomeHugeThing" })
+    #expect(insights.contains(where: { $0.paths.first?.path == home + "/Library" }) == false)
+    #expect(insights.contains(where: { $0.title == "Large folder: SomeHugeThing" }))
 }
 
 @Test func largeFoldersIgnoreClaimedBytes() throws {
@@ -71,7 +71,7 @@ private let gb = Size.gb
     )
     let claimedDir = try #require(insights.first { $0.title == "Large folder: ClaimedDir" })
     #expect(claimedDir.bytes == 400 * mb)
-    #expect(insights.contains { $0.title == "Large folder: Claimed" } == false)
+    #expect(insights.contains(where: { $0.title == "Large folder: Claimed" }) == false)
 }
 
 @Test func largeFoldersRespectMinimumFraction() {
@@ -124,9 +124,9 @@ private let gb = Size.gb
         config: InsightsConfig()
     )
     #expect(insights.count == 2)
-    #expect(insights.allSatisfy { $0.risk == .review && $0.action == .trash })
-    #expect(insights.contains { $0.paths.first?.lastPathComponent == "accessed-long-ago" })
-    #expect(insights.contains { $0.paths.first?.lastPathComponent == "modified-long-ago" })
+    #expect(insights.allSatisfy({ $0.risk == .review && $0.action == .trash }))
+    #expect(insights.contains(where: { $0.paths.first?.lastPathComponent == "accessed-long-ago" }))
+    #expect(insights.contains(where: { $0.paths.first?.lastPathComponent == "modified-long-ago" }))
 }
 
 @Test func staleFilesRespectAgeAndSizeConfiguration() throws {
@@ -214,6 +214,6 @@ private let gb = Size.gb
     )
     let insight = try #require(insights.first)
     #expect(insight.nodeIDs.count == 1)
-    #expect(insight.children.contains { $0.name == "d7" } == false)
-    #expect(insight.children.contains { $0.name == "d6" })
+    #expect(insight.children.contains(where: { $0.name == "d7" }) == false)
+    #expect(insight.children.contains(where: { $0.name == "d6" }))
 }

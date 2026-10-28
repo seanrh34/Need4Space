@@ -110,5 +110,5 @@ private let mb = Size.mb
             AppBundleInfo(path: home + "/Applications/Large.app", name: "Large", bundleID: "large"),
         ]
     )
-    #expect(apps.map(\.name) == ["Large", "Small"])
+    #expect(apps.map { $0.name } == ["Large", "Small"])
 }
