@@ -172,6 +172,9 @@ struct ScannerCore: Sendable {
     /// Throttled snapshot cache (revision 4: at most 1 Hz), keyed by the pruning
     /// parameters so different requests are not served a stale tree.
     var snapshotCache: ScanTree?
+    /// Completed tree shared (copy-on-write, no extra memory) so snapshotTree still works
+    /// after the result has been delivered.
+    var finalTree: ScanTree?
     var snapshotTime: ContinuousClock.Instant?
     var snapshotKey: (maxDepth: Int, minFraction: Double)?
     /// Set when scan() starts; used for the elapsed statistic.
@@ -401,7 +404,7 @@ extension ParallelScanner {
                 return cached
             }
             let snap = Self.prunedCopy(
-                core.builder.tree, maxDepth: maxDepth, minFraction: minFraction)
+                core.finalTree ?? core.builder.tree, maxDepth: maxDepth, minFraction: minFraction)
             core.snapshotCache = snap
             core.snapshotTime = now
             core.snapshotKey = key
@@ -520,6 +523,7 @@ extension ParallelScanner {
         // delivering worker with no locks held; a cancelled scan throws instead of
         // returning a result (review round 2 fix 6).
         if let result = assembleResult(builder: &builder, startedAt: payload.startedAt) {
+            core.withLock { $0.finalTree = result.tree }
             continuation.resume(returning: result)
         } else {
             continuation.resume(throwing: CancellationError())
