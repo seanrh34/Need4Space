@@ -15,7 +15,7 @@ public struct RuleEngine: Sendable {
 
     public init(rules: [Rule] = RuleTable.all, maxPathsPerInsight: Int = 100) {
         self.rules = rules
-        self.maxPathsPerInsight = maxPathsPerInsight
+        self.maxPathsPerInsight = max(0, maxPathsPerInsight)
     }
 
     func evaluate(tree: ScanTree, homePath: String) -> RuleEvaluation {
