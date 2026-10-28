@@ -43,6 +43,7 @@ private func record(
     alloc: UInt64? = nil,
     logical: UInt64? = nil,
     error: Int32? = nil,
+    packZeroError: Bool = false,
     nameGap: Int = 0,
     trailingPad: [UInt8] = []
 ) -> [UInt8] {
@@ -52,7 +53,7 @@ private func record(
 
     var common: UInt32 = Attr.cmnReturnedAttrs
     var file: UInt32 = 0
-    if error != nil { common |= Attr.cmnError }
+    if error != nil || packZeroError { common |= Attr.cmnError }
     if name != nil { common |= Attr.cmnName }
     if objType != nil { common |= Attr.cmnObjType }
     if modTime != nil { common |= Attr.cmnModTime }
@@ -71,7 +72,12 @@ private func record(
 
     if let error {
         b.append(contentsOf: le32(UInt32(bitPattern: error)))
+    } else if packZeroError {
+        b.append(contentsOf: le32(0))
     }
+    // FSOPT_PACK_INVAL_ATTRS: every REQUESTED field has a slot; fields whose returned bit is
+    // clear are zero placeholders. Error records only carry error + name (parser stops there).
+    let packAll = error == nil
 
     // attrreference_t for the name; data offset is relative to the attrref field itself
     // and lands after the fixed fields plus nameGap filler bytes.
@@ -81,21 +87,21 @@ private func record(
         // Patched once the data position is known; reserve the slot now.
         b.append(contentsOf: le32(0)) // offset placeholder
         b.append(contentsOf: le32(UInt32(nameData.count + 1))) // length incl. NUL
+    } else if packAll {
+        b.append(contentsOf: [UInt8](repeating: 0, count: 8))
     }
-    if devid != nil { b.append(contentsOf: le32(UInt32(bitPattern: devid!))) }
-    if objType != nil { b.append(contentsOf: le32(objType!)) }
-    if modTime != nil {
-        b.append(contentsOf: le64(UInt64(bitPattern: modTime!)))
-        b.append(contentsOf: le64(999_999_999)) // tv_nsec, ignored
+    if packAll {
+        b.append(contentsOf: le32(UInt32(bitPattern: devid ?? 0)))
+        b.append(contentsOf: le32(objType ?? 0))
+        b.append(contentsOf: le64(UInt64(bitPattern: modTime ?? 0)))
+        b.append(contentsOf: le64(modTime == nil ? 0 : 999_999_999)) // tv_nsec, ignored
+        b.append(contentsOf: le64(UInt64(bitPattern: accTime ?? 0)))
+        b.append(contentsOf: le64(accTime == nil ? 0 : 1))
+        b.append(contentsOf: le64(fileID ?? 0))
+        b.append(contentsOf: le32(linkCount ?? 0))
+        b.append(contentsOf: le64(alloc ?? 0))
+        b.append(contentsOf: le64(logical ?? 0))
     }
-    if accTime != nil {
-        b.append(contentsOf: le64(UInt64(bitPattern: accTime!)))
-        b.append(contentsOf: le64(1))
-    }
-    if fileID != nil { b.append(contentsOf: le64(fileID!)) }
-    if linkCount != nil { b.append(contentsOf: le32(linkCount!)) }
-    if alloc != nil { b.append(contentsOf: le64(alloc!)) }
-    if logical != nil { b.append(contentsOf: le64(logical!)) }
 
     if name != nil {
         b.append(contentsOf: [UInt8](repeating: 0xAB, count: nameGap))
@@ -152,19 +158,19 @@ struct ParserTests {
     @Test func recordLayoutMatchesHardCodedByteOffsets() {
         // [0] len u32 | [4] attr set (20) | [24] NAME ref (8) | [32] DEVID (4)
         // [36] OBJTYPE (4) | [40] MODTIME (16) | [56] ACCTIME (16) | [72] FILEID (8)
-        // [80] LINKCOUNT (4) | [84] ALLOCSIZE (8) | [92] DATALENGTH (8) | [96] "AB\0"
+        // [80] LINKCOUNT (4) | [84] ALLOCSIZE (8) | [92] DATALENGTH (8) | [100] "AB\0"
         let buf = record(
             name: "AB", objType: 7, modTime: 111, accTime: 222, fileID: 33,
             devid: 44, linkCount: 2, alloc: 55, logical: 66)
-        #expect(buf.count == 99)
-        #expect(le32at(buf, 0) == 99) // record length
+        #expect(buf.count == 103)
+        #expect(le32at(buf, 0) == 103) // record length
         #expect(le32at(buf, 4) == Attr.cmnReturnedAttrs | Attr.cmnName | Attr.cmnDevID
             | Attr.cmnObjType | Attr.cmnModTime | Attr.cmnAccTime | Attr.cmnFileID)
         #expect(le32at(buf, 8) == 0) // volattr
         #expect(le32at(buf, 12) == 0) // dirattr
         #expect(le32at(buf, 16) == Attr.fileLinkCount | Attr.fileAllocSize | Attr.fileDataLength)
         #expect(le32at(buf, 20) == 0) // forkattr
-        #expect(le32at(buf, 24) == 96 - 24) // name data offset, relative to the attrref
+        #expect(le32at(buf, 24) == 100 - 24) // name data offset, relative to the attrref
         #expect(le32at(buf, 28) == 3) // "AB" + NUL
         #expect(le32at(buf, 32) == 44) // DEVID
         #expect(le32at(buf, 36) == 7) // OBJTYPE
@@ -187,14 +193,14 @@ struct ParserTests {
         #expect(e.logicalSize == 66)
     }
 
-    @Test func mixedReturnedAttrsLeaveMissingFieldsNil() {
+    @Test func mixedReturnedAttrsLeaveMissingFieldsNil() throws {
         // Only NAME, OBJTYPE and ALLOCSIZE returned; other requested slots are
         // zero-filled placeholders (FSOPT_PACK_INVAL_ATTRS) and must read as nil.
         let buf = record(
             name: "mixed.bin", objType: Attr.ObjType.vreg, modTime: nil, accTime: nil,
             fileID: nil, devid: nil, linkCount: nil, alloc: 8192, logical: nil)
         let entries = parse(buf, count: 1)
-        #expect(entries.count == 1)
+        try #require(entries.count == 1)
         let e = entries[0]
         #expect(e.name.map { String(decoding: $0, as: UTF8.self) } == "mixed.bin")
         #expect(e.objType == Attr.ObjType.vreg)
@@ -205,6 +211,19 @@ struct ParserTests {
         #expect(e.devid == nil)
         #expect(e.linkCount == nil)
         #expect(e.logicalSize == nil)
+    }
+
+    /// Real kernels pack ATTR_CMN_ERROR = 0 with its returned bit set for successful entries.
+    @Test func zeroErrorSlotIsASuccessfulEntry() throws {
+        let buf = record(name: "ok.bin", objType: Attr.ObjType.vreg, fileID: 9, devid: 3,
+                         linkCount: 1, alloc: 4096, logical: 100, packZeroError: true)
+        let entries = parse(buf, count: 1)
+        try #require(entries.count == 1)
+        #expect(entries[0].error == nil)
+        #expect(entries[0].name.map { String(decoding: $0, as: UTF8.self) } == "ok.bin")
+        #expect(entries[0].allocSize == 4096)
+        #expect(entries[0].fileID == 9)
+        #expect(entries[0].devid == 3)
     }
 
     @Test func perEntryErrorCarriesNameAndSkipsNothing() {

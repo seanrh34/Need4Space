@@ -196,14 +196,19 @@ enum DirectoryReader {
             var entry = RawEntry()
             var offset = setBase + Attr.attributeSetByteWidth
 
+            // The error value follows the returned set immediately (man page example). Under
+            // FSOPT_PACK_INVAL_ATTRS the kernel packs it for EVERY entry with its returned bit
+            // set and value 0 on success, so only a non-zero value marks a failed entry.
+            var entryError: Int32 = 0
             if returnedCommon & Attr.cmnError != 0 {
-                // Per the man page example: the error value follows the returned set
-                // immediately; the entry name (if returned) follows. Other fields of a
-                // failed entry are not packed reliably, so only name + error are read.
                 guard offset + 4 <= recordEnd else { break }
-                entry.error = Int32(bitPattern: buf.loadUnaligned(
+                entryError = Int32(bitPattern: buf.loadUnaligned(
                     fromByteOffset: offset, as: UInt32.self))
                 offset += 4
+            }
+            if entryError != 0 {
+                // Other fields of a failed entry are not packed reliably: read name + error.
+                entry.error = entryError
                 if returnedCommon & Attr.cmnName != 0 {
                     guard offset + 8 <= recordEnd else { break }
                     if let name = readName(at: offset, recordStart: recordStart, recordEnd: recordEnd, buf: buf) {
