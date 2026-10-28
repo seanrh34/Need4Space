@@ -50,7 +50,9 @@ public struct RuleEngine: Sendable {
                     guard Int(id) >= 0, Int(id) < tree.count else { continue }
                     let include: Bool
                     switch pattern {
-                    case .home(_), .absolute(_), .downloads:
+                    case .home(_), .absolute(_):
+                        include = true
+                    case .downloads:
                         include = true
                     case .homeGlobChildren(_), .homeGlob(_), .anyDirectoryNamed(_):
                         include = tree.allocSize[Int(id)] >= rule.minBytes
