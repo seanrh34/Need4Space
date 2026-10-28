@@ -179,3 +179,56 @@ Each step: plan review → implement → orchestrator + Codex diff review → fi
   large folder coverage exclusion, stale file with/without atime, hidden-space math incl. overcount,
   ranking tie-break, reclaimable dedupe, perf test on synthetic 1M-node tree (< 2 s, release).
 - Safety (M3): protected path table tests; careful ⇒ no delete action; grep gate script in CI.
+
+## Revisions after plan review (Codex, 2026-10-28) — these OVERRIDE earlier sections
+1. **Accounting scope.** `VolumeInfo.usedBytes = volumeTotalCapacity - volumeAvailableCapacity` for
+   the URL `/` (APFS container-wide, what Finder shows). Scanned set = System volume + Data volume
+   (via firmlinks; never traverse `/System/Volumes/Data` directly) + `/private/var/vm`. Everything
+   else (Preboot, Recovery, Update, other container volumes, snapshots, clones, metadata) lands in
+   the hidden-space remainder. Allowed devids for a `/` scan: devid(`/`) and devid(`/System/Volumes/Data`).
+   The scanner records how many mount points it skipped and their paths (`ScanResult` stats).
+2. **`/private/var/vm`** is scanned **recursively** as an explicit exception (its own devid allowed only
+   inside that subtree), then attached as one directory node with its completed total.
+3. **Directory completion protocol** (under the builder lock): each dir has `listingDone: Bool` and
+   `pendingChildDirs: Int32`. When its listing is appended, set `listingDone = true` and
+   `pendingChildDirs = number of child dirs enqueued`. Finalize iff `listingDone && pending == 0`,
+   exactly once; finalizing sums children, then decrements the parent's pending and re-checks it
+   (iterative, not recursive). Failed/blocked dirs finalize immediately with size 0.
+   Tests: empty dirs, 200-deep chain, blocked dirs, wide dirs (10k entries), many threads.
+4. **No CoW spikes.** The builder never holds `ChildSequence`/tree copies while mutating; use index
+   loops. Live UI snapshots are `snapshotTree(maxDepth: 4, minFraction: 0.001)` — a *pruned* copy
+   (sunburst only shows 4 rings), at most every 1 s. Progress values are small structs.
+5. **getattrlistbulk parsing**: bounds-check every record length against the buffer; read each
+   optional field only if its bit is set in `returned_attrs`; `attrreference_t.attr_dataoffset` is
+   relative to the reference field's own address; validate offset+length within the record; use
+   `loadUnaligned`. Factor the parser as a pure function `parseAttrBuffer(_ buf: UnsafeRawBufferPointer,
+   count: Int) -> [RawEntry]` so it can be unit-tested with hand-built buffers (mixed returned
+   attrs, per-entry error, truncated record).
+6. **Concurrency design**: `ParallelScanner` is a `final class: Sendable` whose mutable state lives
+   only in `Mutex<…>` / `Atomic<…>` (Synchronization). One-shot: calling `scan()` twice throws.
+   Worker threads are `Thread`s; `scan()` bridges completion with `withCheckedThrowingContinuation`
+   resumed exactly once (by the last worker or by cancellation). The progress `AsyncStream`
+   continuation is finished on completion, error or cancel. Cancellation → `CancellationError`.
+7. **Hidden space is not additive.** Report `gap = used - scanned` (or overcount if negative),
+   then list measured facts separately: purgeable bytes (note: may include snapshot space),
+   snapshot count (+ bytes only if known), blocked folder count, remainder =
+   `max(0, gap - purgeable)` labelled "APFS clones, system volumes and metadata". Never show negatives.
+8. **Hard links, deterministic**: during the walk, entries with linkcount > 1 get size 0 and are
+   recorded as `(devid, fileid, nodeID, alloc, logical)`. After the walk, per (devid, fileid) group, the
+   owner is the node with the lexicographically smallest path; add its bytes to it and its ancestors.
+   Stats count deduplicated links. Test: hard links in sibling folders → stable owner across runs.
+9. **Small files**: grouping stays (spec), but files with extensions `.dmg .pkg .zip .xip .iso` are never
+   grouped. Acting on individual small files = UI performs a one-directory listing on demand (M4).
+10. **Ranking**: sort by bytes desc, then repeat passes promoting a safe item ahead of a non-safe
+    predecessor whose bytes are within 20% of it, until no change. Test chains of ≥3.
+11. **Large folders**: `uncovered(dir) = alloc(dir) - bytes of claimed (rule/app) nodes inside it`.
+    Candidate if uncovered ≥ 3% of used. Report a candidate only if no child candidate holds ≥ 50%
+    of its uncovered bytes (push down to where the mass is). Never report `/`, `/Users`, home,
+    `~/Library`, `/System`, `/Applications`, `/Library`, `/private` themselves.
+12. Memory budget includes side arrays (pending, listingDone), hard-link records, queue; benchmark
+    reports peak RSS. Target remains < 200 MB at 1M nodes.
+13. **Milestone order**: M3 (safe actions) also does in-memory subtree removal after Trash
+    (subtract from ancestors). Basic persistence (save/load + "scanned X ago") moves right after
+    the M2 app shell; FSEvents incremental refresh stays later.
+14. **Empty Trash** conflicts with acceptance criterion 4 (no permanent deletion). Default until Sean
+    decides: the Trash insight only offers "Open Trash in Finder"; no programmatic emptying.
