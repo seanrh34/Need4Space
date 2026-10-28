@@ -94,7 +94,7 @@ struct FixtureNode {
 enum FixtureTree {
     static let defaultRootPath = "/Users/tester"
 
-    static func build(rootPath: String = defaultRootPath, _ nodes: [FixtureNode]) -> ScanTree {
+    static func build(rootPath: String = FixtureTree.defaultRootPath, _ nodes: [FixtureNode]) -> ScanTree {
         var tree = ScanTree(rootPath: rootPath)
         _ = tree.addNode(name: "", kind: .directory, parent: ScanTree.none)
         for node in nodes {
