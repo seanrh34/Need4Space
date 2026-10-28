@@ -13,6 +13,16 @@ swift run -c release n4s-scan /        # milestone 1 benchmark
 ## Benchmarks
 _Recorded after each milestone._
 
+### Milestone 1 (2026-10-28, GitHub Actions `macos-15` arm64 runner, virtual disk)
+| Scan | Files | Nodes | Time | Peak RSS | vs `du -sk` |
+|---|---|---|---|---|---|
+| `/Applications` (9 Xcode installs, 209k hard links) | 1,039,103 | 497,924 | 43.4 s | 122 MB | 0.00% |
+| `$HOME` | 455,842 | 220,244 | 5.6 s | 42 MB | 0.00% (`~/Library`, `~/.dotnet`, NDK) |
+
+CI disks are slow and noisy; the spec's 30 s full-disk target must be confirmed on a real Mac
+(`swift run -c release n4s-scan /`). Memory projects to roughly 240 MB at 1M nodes (budget 200 MB):
+follow-up.
+
 ## How to verify on a Mac (M1 scanner + n4s-scan)
 
 Requires macOS 15 and Xcode 16 (Swift 6). Run from the package root.
