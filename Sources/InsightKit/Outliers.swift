@@ -61,45 +61,61 @@ enum Outliers {
         var isCandidate = [Bool](repeating: false, count: nodeCount)
         for id in candidateIDs { isCandidate[Int(id)] = true }
 
-        let excluded = excludedPaths(homePath: homePath)
+        // One forward pass for depth and nearest candidate ancestor; no per-candidate tree walks.
+        var depth = [Int32](repeating: 0, count: nodeCount)
+        var nearestCandidate = [NodeID](repeating: ScanTree.none, count: nodeCount)
+        index = 1
+        while index < nodeCount {
+            let parentIndex = Int(tree.parent[index])
+            if parentIndex >= 0 {
+                depth[index] = depth[parentIndex] + 1
+                nearestCandidate[index] = isCandidate[parentIndex]
+                    ? NodeID(parentIndex)
+                    : nearestCandidate[parentIndex]
+            }
+            index += 1
+        }
+
+        let excludedIDs = Self.excludedNodeIDs(tree: tree, homePath: homePath)
         var suppressed = Set<NodeID>()
         for id in candidateIDs {
-            var parent = tree.parent[Int(id)]
-            while parent >= 0 {
-                if isCandidate[Int(parent)] {
-                    let childUncovered = uncovered(tree: tree, id: id, claimedBytes: claimedBytes)
-                    let parentUncovered = uncovered(tree: tree, id: NodeID(parent), claimedBytes: claimedBytes)
-                    if Double(childUncovered) >= 0.5 * Double(parentUncovered) {
-                        suppressed.insert(NodeID(parent))
-                    }
-                    break
+            let ancestor = nearestCandidate[Int(id)]
+            if ancestor >= 0 {
+                let childUncovered = uncovered(tree: tree, id: id, claimedBytes: claimedBytes)
+                let parentUncovered = uncovered(
+                    tree: tree,
+                    id: ancestor,
+                    claimedBytes: claimedBytes
+                )
+                if Double(childUncovered) >= 0.5 * Double(parentUncovered) {
+                    suppressed.insert(ancestor)
                 }
-                parent = tree.parent[Int(parent)]
             }
         }
 
         let ordered = candidateIDs.sorted { lhs, rhs in
-            tree.depth(lhs) < tree.depth(rhs)
+            let lhsDepth = depth[Int(lhs)]
+            let rhsDepth = depth[Int(rhs)]
+            if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
+            return lhs < rhs
         }
         var reported: [NodeID] = []
         var reportedSet = Set<NodeID>()
+        var hasReportedAncestor = [Bool](repeating: false, count: nodeCount)
         for id in ordered {
             if suppressed.contains(id) { continue }
-            if excluded.contains(tree.path(id)) { continue }
-            var parent = tree.parent[Int(id)]
-            var ancestorReported = false
-            while parent >= 0 {
-                if reportedSet.contains(NodeID(parent)) {
-                    ancestorReported = true
-                    break
-                }
-                parent = tree.parent[Int(parent)]
+            if excludedIDs.contains(id) { continue }
+            let ancestor = nearestCandidate[Int(id)]
+            if ancestor >= 0,
+               reportedSet.contains(ancestor) || hasReportedAncestor[Int(ancestor)] {
+                hasReportedAncestor[Int(id)] = true
+                continue
             }
-            if ancestorReported { continue }
             reported.append(id)
             reportedSet.insert(id)
         }
 
+        // Path strings are built only for nodes that are actually reported.
         var insights: [Insight] = []
         insights.reserveCapacity(reported.count)
         for id in reported {
@@ -109,13 +125,14 @@ enum Outliers {
                 format: "%.1f%% of used space is not explained by any known rule or app.",
                 percent
             )
+            let path = tree.path(id)
             insights.append(
                 Insight(
-                    id: "largeFolder.\(Int(id))",
+                    id: "largeFolder:\(path)",
                     title: "Large folder: \(tree.name(id))",
                     detail: detail,
                     nodeIDs: [id],
-                    paths: [URL(fileURLWithPath: tree.path(id))],
+                    paths: [URL(fileURLWithPath: path)],
                     bytes: uncoveredBytes,
                     risk: .review,
                     action: .revealOnly,
@@ -134,9 +151,9 @@ enum Outliers {
         return alloc > claimedBytes[index] ? alloc - claimedBytes[index] : 0
     }
 
-    private static func excludedPaths(homePath: String) -> Set<String> {
+    private static func excludedNodeIDs(tree: ScanTree, homePath: String) -> Set<NodeID> {
         let home = PathSupport.normalize(homePath)
-        return [
+        let paths = [
             "/",
             "/Users",
             "/System",
@@ -146,6 +163,11 @@ enum Outliers {
             home,
             PathSupport.join(home, "Library"),
         ]
+        var result = Set<NodeID>()
+        for path in paths {
+            if let id = tree.node(atPath: path) { result.insert(id) }
+        }
+        return result
     }
 
     // MARK: - Large stale files
@@ -154,17 +176,37 @@ enum Outliers {
         tree: ScanTree,
         now: Date,
         homePath: String,
-        config: InsightsConfig
+        config: InsightsConfig,
+        protected: [NodeID: SuggestedAction] = [:]
     ) -> [Insight] {
+        let nodeCount = tree.count
         let nowSeconds = Int64(now.timeIntervalSince1970)
         let ageSeconds = Int64(config.staleFileAgeDays) * 86_400
-        guard ageSeconds > 0, tree.count > 0 else { return [] }
+        guard ageSeconds > 0, nodeCount > 0 else { return [] }
+
+        // One forward pass: parents have lower indices than their children.
+        var insideBundle = [Bool](repeating: false, count: nodeCount)
+        var inheritedProtection = [UInt8](repeating: 0, count: nodeCount)
+        var index = 0
+        while index < nodeCount {
+            let parent = Int(tree.parent[index])
+            if parent >= 0 {
+                insideBundle[index] = insideBundle[parent]
+                inheritedProtection[index] = inheritedProtection[parent]
+            }
+            if tree.kind[index] == .bundle { insideBundle[index] = true }
+            if let action = protected[NodeID(index)] {
+                inheritedProtection[index] = Self.protectionCode(action)
+            }
+            index += 1
+        }
 
         var insights: [Insight] = []
-        var index = 0
-        while index < tree.count {
+        index = 0
+        while index < nodeCount {
             if tree.kind[index] == .file,
-               tree.allocSize[index] >= config.staleFileMinBytes {
+               tree.allocSize[index] >= config.staleFileMinBytes,
+               !insideBundle[index] {
                 let access = tree.accessTime[index]
                 let modified = tree.modTime[index]
                 let timestamp = access != 0 ? access : modified
@@ -173,19 +215,31 @@ enum Outliers {
                     if elapsed >= ageSeconds {
                         let id = NodeID(index)
                         let usedAccessTime = access != 0
-                        let detail = usedAccessTime
+                        let protection = inheritedProtection[index]
+                        let risk: Risk = protection == 0 ? .review : .careful
+                        let action: SuggestedAction
+                        switch protection {
+                        case 2: action = .displayOnly
+                        case 1: action = .revealOnly
+                        default: action = .trash
+                        }
+                        var detail = usedAccessTime
                             ? "Last accessed \(config.staleFileAgeDays) days ago or more."
                             : "Access time is unavailable; last modified \(config.staleFileAgeDays) days ago or more."
+                        if protection != 0 {
+                            detail += " This file is inside a location that should not be trashed from this app."
+                        }
+                        let path = tree.path(id)
                         insights.append(
                             Insight(
-                                id: "staleFile.\(index)",
+                                id: "staleFile:\(path)",
                                 title: "Large file not used in over a year: \(tree.name(id))",
                                 detail: detail,
                                 nodeIDs: [id],
-                                paths: [URL(fileURLWithPath: tree.path(id))],
+                                paths: [URL(fileURLWithPath: path)],
                                 bytes: tree.allocSize[index],
-                                risk: .review,
-                                action: .trash,
+                                risk: risk,
+                                action: action,
                                 children: [],
                                 category: Category.forNode(id, in: tree, homePath: homePath)
                             )
@@ -197,6 +251,11 @@ enum Outliers {
         }
         insights.sort { $0.bytes > $1.bytes }
         return insights
+    }
+
+    private static func protectionCode(_ action: SuggestedAction) -> UInt8 {
+        if case .displayOnly = action { return 2 }
+        return 1
     }
 
     // MARK: - Fast growers
@@ -236,7 +295,7 @@ enum Outliers {
             while parent >= 0 {
                 let parentID = NodeID(parent)
                 if candidates.contains(parentID) { hasCandidateDescendant.insert(parentID) }
-                parent = tree.parent[parent]
+                parent = tree.parent[Int(parent)]
             }
         }
         var reported = grown.filter { !hasCandidateDescendant.contains($0.id) }
@@ -260,10 +319,11 @@ enum Outliers {
             format: "Folders that grew by more than %.1f GB since the previous scan.",
             gigabytes
         )
+        let root = PathSupport.normalize(tree.rootPath)
 
         return [
             Insight(
-                id: "outlier.fastGrowers",
+                id: "outlier.fastGrowers:\(root)",
                 title: "Folders that grew since the last scan",
                 detail: detail,
                 nodeIDs: ids,
@@ -289,28 +349,37 @@ enum Outliers {
         guard depth < config.growthMaxDepth else { return }
         var child = tree.firstChild[Int(current)]
         while child >= 0 {
-            if tree.kind[Int(child)].isContainer {
+            if tree.kind[Int(child)] == .directory {
                 let childDepth = depth + 1
-                if let oldChild = tree.childMatchingName(of: previous, nameOf: child) {
-                    let newBytes = tree.allocSize[Int(child)]
-                    let oldBytes = oldTree.allocSize[Int(oldChild)]
-                    if newBytes > oldBytes {
-                        let growth = newBytes - oldBytes
-                        if growth >= config.growthMinBytes {
-                            grown.append((id: child, growth: growth))
-                        }
+                let oldChild = tree.childMatchingNameIn(
+                    oldTree,
+                    of: previous,
+                    nameOf: child
+                )
+                let newBytes = tree.allocSize[Int(child)]
+                let oldBytes: UInt64
+                if let oldChild {
+                    oldBytes = oldTree.allocSize[Int(oldChild)]
+                } else {
+                    // Missing from the previous scan: the whole folder is new growth.
+                    oldBytes = 0
+                }
+                if newBytes > oldBytes {
+                    let growth = newBytes - oldBytes
+                    if growth >= config.growthMinBytes {
+                        grown.append((id: child, growth: growth))
                     }
-                    if childDepth < config.growthMaxDepth {
-                        visitGrowth(
-                            current: child,
-                            previous: oldChild,
-                            depth: childDepth,
-                            tree: tree,
-                            oldTree: oldTree,
-                            config: config,
-                            grown: &grown
-                        )
-                    }
+                }
+                if let oldChild, childDepth < config.growthMaxDepth {
+                    visitGrowth(
+                        current: child,
+                        previous: oldChild,
+                        depth: childDepth,
+                        tree: tree,
+                        oldTree: oldTree,
+                        config: config,
+                        grown: &grown
+                    )
                 }
             }
             child = tree.nextSibling[Int(child)]

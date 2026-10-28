@@ -225,36 +225,6 @@ public enum RuleTable {
             category: .developer
         ),
         Rule(
-            id: "developer.buildOutputs",
-            title: "Dependency and build output folders",
-            detail: "node_modules, target, build and .venv folders. Reinstalling dependencies recreates them; review by project.",
-            patterns: [.anyDirectoryNamed(["node_modules", "target", "build", ".venv"])],
-            risk: .review,
-            action: .revealOnly,
-            category: .developer
-        ),
-        Rule(
-            id: "userCaches",
-            title: "User caches",
-            detail: "Per-application caches in ~/Library/Caches. Apps rebuild them as needed.",
-            patterns: [.homeGlobChildren("Library/Caches")],
-            risk: .safe,
-            action: .trash,
-            category: .caches
-        ),
-        Rule(
-            id: "logs",
-            title: "Logs",
-            detail: "Application and system logs. Safe to move to the Trash; new logs are written as needed.",
-            patterns: [
-                .home("Library/Logs"),
-                .absolute("/Library/Logs"),
-            ],
-            risk: .safe,
-            action: .trash,
-            category: .system
-        ),
-        Rule(
             id: "downloads",
             title: "Large downloads and installers",
             detail: "Files over 500 MB plus .dmg, .pkg and .zip installers in ~/Downloads. Review before moving them to the Trash.",
@@ -293,6 +263,37 @@ public enum RuleTable {
             action: .displayOnly,
             category: .system
         ),
+        Rule(
+            id: "userCaches",
+            title: "User caches",
+            detail: "Per-application caches in ~/Library/Caches. Apps rebuild them as needed.",
+            patterns: [.homeGlobChildren("Library/Caches")],
+            risk: .safe,
+            action: .trash,
+            category: .caches
+        ),
+        Rule(
+            id: "logs",
+            title: "Logs",
+            detail: "Application and system logs. Safe to move to the Trash; new logs are written as needed.",
+            patterns: [
+                .home("Library/Logs"),
+                .absolute("/Library/Logs"),
+            ],
+            risk: .safe,
+            action: .trash,
+            category: .system
+        ),
+        Rule(
+            id: "developer.buildOutputs",
+            title: "Dependency and build output folders",
+            detail: "node_modules, target, build and .venv folders. Reinstalling dependencies recreates them; review by project.",
+            patterns: [.anyDirectoryNamed(["node_modules", "target", "build", ".venv"])],
+            risk: .review,
+            action: .revealOnly,
+            category: .developer
+        ),
+
     ]
 
     /// Kept explicit so the default does not drift from the SPEC.

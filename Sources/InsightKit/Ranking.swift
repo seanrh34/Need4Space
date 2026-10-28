@@ -1,7 +1,8 @@
 import Foundation
 
-/// Ranking per SPEC section 6 and PLAN revision 10: bytes descending, then repeated passes that
-/// promote a safe item ahead of a non-safe predecessor when their sizes are within 20%.
+/// Ranking per SPEC section 6 and PLAN revision 10: bytes descending, then safe items are moved
+/// left past non-safe predecessors whose sizes are within 20%. Insertion-style promotion keeps this
+/// bounded instead of repeating whole-array passes.
 public enum Ranking {
     public static func rank(_ insights: [Insight]) -> [Insight] {
         var items = insights.sorted { lhs, rhs in
@@ -10,21 +11,22 @@ public enum Ranking {
         }
         guard items.count > 1 else { return items }
 
-        var changed = true
-        while changed {
-            changed = false
-            var index = 1
-            while index < items.count {
-                let current = items[index]
-                let previous = items[index - 1]
-                if current.risk == .safe,
-                   previous.risk != .safe,
-                   withinTwentyPercent(current.bytes, previous.bytes) {
-                    items.swapAt(index - 1, index)
-                    changed = true
+        var index = 1
+        while index < items.count {
+            let current = items[index]
+            if current.risk == .safe {
+                var position = index
+                while position > 0 {
+                    let predecessor = items[position - 1]
+                    guard predecessor.risk != .safe,
+                          withinTwentyPercent(current.bytes, predecessor.bytes) else {
+                        break
+                    }
+                    items.swapAt(position - 1, position)
+                    position -= 1
                 }
-                index += 1
             }
+            index += 1
         }
         return items
     }

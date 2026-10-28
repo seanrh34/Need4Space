@@ -51,11 +51,15 @@ public struct InsightChild: Sendable, Hashable {
     public var name: String
     public var bytes: UInt64
     public var nodeID: NodeID
+    /// Modification time of the child's parent folder. Non-zero for build-output matches, used to
+    /// offer a "most recently worked on project" ordering next to the size ordering.
+    public var projectModTime: Int64
 
-    public init(name: String, bytes: UInt64, nodeID: NodeID) {
+    public init(name: String, bytes: UInt64, nodeID: NodeID, projectModTime: Int64 = 0) {
         self.name = name
         self.bytes = bytes
         self.nodeID = nodeID
+        self.projectModTime = projectModTime
     }
 }
 
@@ -73,6 +77,8 @@ public struct Insight: Sendable, Identifiable, Hashable {
     public var action: SuggestedAction
     /// Up to ten entries, largest first.
     public var children: [InsightChild]
+    /// Alternate top ten ordered by project modification time (build-output insights only).
+    public var childrenByProjectDate: [InsightChild]
     public var category: Category
 
     public init(
@@ -85,6 +91,7 @@ public struct Insight: Sendable, Identifiable, Hashable {
         risk: Risk,
         action: SuggestedAction,
         children: [InsightChild] = [],
+        childrenByProjectDate: [InsightChild] = [],
         category: Category = .other
     ) {
         self.id = id
@@ -96,6 +103,7 @@ public struct Insight: Sendable, Identifiable, Hashable {
         self.risk = risk
         self.action = action
         self.children = children
+        self.childrenByProjectDate = childrenByProjectDate
         self.category = category
     }
 }

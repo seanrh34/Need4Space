@@ -70,6 +70,7 @@ private let gb = Size.gb
         config: InsightsConfig()
     )
     let claimedDir = try #require(insights.first { $0.title == "Large folder: ClaimedDir" })
+    #expect(claimedDir.id == "largeFolder:\(home)/ClaimedDir")
     #expect(claimedDir.bytes == 400 * mb)
     #expect(insights.contains(where: { $0.title == "Large folder: Claimed" }) == false)
 }
@@ -175,10 +176,12 @@ private let gb = Size.gb
         config: InsightsConfig()
     )
     let insight = try #require(insights.first)
-    #expect(insight.id == "outlier.fastGrowers")
-    #expect(insight.bytes == 1 * gb)
-    #expect(insight.nodeIDs.count == 1)
-    #expect(insight.children.first?.name == "Grew")
+    #expect(insight.id == "outlier.fastGrowers:\(home)")
+    #expect(insight.bytes == 6 * gb)
+    #expect(insight.nodeIDs.count == 2)
+    #expect(insight.children.first?.name == "OtherNew")
+    #expect(insight.children.first?.bytes == 5 * gb)
+    #expect(insight.children.last?.name == "Grew")
 }
 
 @Test func fastGrowersNeedAPreviousScan() {

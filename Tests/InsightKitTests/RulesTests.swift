@@ -12,6 +12,14 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
     RuleEngine().evaluate(tree: tree, homePath: homePath).insights
 }
 
+private func find(_ insights: [Insight], _ id: String) -> Insight? {
+    insights.first { $0.id == id || $0.id.hasPrefix(id + ":") }
+}
+
+private func containsInsight(_ insights: [Insight], _ id: String) -> Bool {
+    find(insights, id) != nil
+}
+
 @Test func ruleTableIsWellFormed() {
     #expect(RuleTable.all.count >= 20)
     let ids = RuleTable.all.map(\.id)
@@ -35,12 +43,13 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             ]),
         ]),
     ])
-    let insight = try #require(insights(tree).first { $0.id == "xcode.derivedData" })
+    let insight = try #require(find(insights(tree), "xcode.derivedData"))
     #expect(insight.bytes == 300 * mb)
     #expect(insight.risk == .safe)
     #expect(insight.action == .trash)
     #expect(insight.category == .developer)
     #expect(insight.paths.first?.path == home + "/Library/Developer/Xcode/DerivedData")
+    #expect(insight.id == "xcode.derivedData:\(home)/Library/Developer/Xcode/DerivedData")
     #expect(insight.nodeIDs.count == 1)
 }
 
@@ -48,7 +57,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
     let tree = FixtureTree.build([
         .dir(".Trash", [.file("old.zip", 250 * mb)]),
     ])
-    let insight = try #require(insights(tree).first { $0.id == "trash" })
+    let insight = try #require(find(insights(tree), "trash"))
     #expect(insight.action == .revealOnly)
     #expect(insight.risk == .safe)
     #expect(insight.category == .trash)
@@ -69,7 +78,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             ]),
         ]),
     ])
-    #expect(insights(tree).contains(where: { $0.id == "xcode.derivedData" }) == false)
+    #expect(containsInsight(insights(tree), "xcode.derivedData") == false)
 }
 
 @Test func perRuleMinimumOverride() throws {
@@ -82,13 +91,13 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             ]),
         ]),
     ])
-    #expect(insights(tree).contains(where: { $0.id == "xcode.derivedData" }) == false)
+    #expect(containsInsight(insights(tree), "xcode.derivedData") == false)
 
     var rule = try #require(RuleTable.all.first { $0.id == "xcode.derivedData" })
     rule.minBytes = 100 * mb
     let custom = RuleEngine(rules: [rule]).evaluate(tree: tree, homePath: home).insights
     let insight = try #require(custom.first)
-    #expect(insight.id == "xcode.derivedData")
+    #expect(insight.id.hasPrefix("xcode.derivedData:"))
     #expect(insight.bytes == 150 * mb)
 }
 
@@ -102,7 +111,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             ]),
         ]),
     ])
-    #expect(insights(tree).contains(where: { $0.id == "xcode.derivedData" }))
+    #expect(containsInsight(insights(tree), "xcode.derivedData"))
 }
 
 @Test func absolutePatternMatchesOutsideHome() throws {
@@ -112,25 +121,38 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
         ]),
         .dir("Users", [.dir("tester", [])]),
     ])
-    let insight = try #require(insights(tree).first { $0.id == "logs" })
+    let insight = try #require(find(insights(tree), "logs"))
     #expect(insight.bytes == 300 * mb)
     #expect(insight.paths.contains(where: { $0.path == "/Library/Logs" }))
 }
 
-@Test func perSubfolderChildrenAreAggregated() throws {
+@Test func perSubfolderChildrenRespectPerItemMinimum() throws {
     let tree = FixtureTree.build([
         .dir("Library", [
             .dir("Caches", [
-                .dir("com.example.a", [.file("f", 150 * mb)]),
-                .dir("com.example.b", [.file("f", 150 * mb)]),
+                .dir("com.example.a", [.file("f", 250 * mb)]),
+                .dir("com.example.b", [.file("f", 300 * mb)]),
+                .dir("com.example.small", [.file("f", 150 * mb)]),
                 .file("loose-cache-file", 1 * gb),
             ]),
         ]),
     ])
-    let insight = try #require(insights(tree).first { $0.id == "userCaches" })
-    #expect(insight.bytes == 300 * mb)
+    let insight = try #require(find(insights(tree), "userCaches"))
+    #expect(insight.bytes == 550 * mb)
     #expect(insight.nodeIDs.count == 2)
     #expect(insight.children.count == 2)
+}
+
+@Test func globMatchesRespectPerItemMinimum() throws {
+    let tree = FixtureTree.build([
+        .dir("Pictures", [
+            .dir("Small.photoslibrary", [.file("database", 150 * mb)]),
+            .dir("Big.photoslibrary", [.file("database", 300 * mb)]),
+        ]),
+    ])
+    let insight = try #require(find(insights(tree), "photosLibrary"))
+    #expect(insight.bytes == 300 * mb)
+    #expect(insight.nodeIDs.count == 1)
 }
 
 @Test func globMatchesLastComponent() throws {
@@ -142,7 +164,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
         ]),
         .dir("Movies", [.dir("Travelling.photoslibrary", [.file("x", 1 * gb)])]),
     ])
-    let insight = try #require(insights(tree).first { $0.id == "photosLibrary" })
+    let insight = try #require(find(insights(tree), "photosLibrary"))
     #expect(insight.bytes == 550 * mb)
     #expect(insight.nodeIDs.count == 2)
     #expect(insight.risk == .careful)
@@ -163,11 +185,73 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             ]),
         ]),
     ])
-    let insight = try #require(insights(tree).first { $0.id == "developer.buildOutputs" })
+    let insight = try #require(find(insights(tree), "developer.buildOutputs"))
     #expect(insight.nodeIDs.count == 1)
     #expect(insight.bytes == 550 * mb)
     let outer = tree.node(atPath: home + "/Projects/app/node_modules")
     #expect(insight.nodeIDs.first == outer)
+}
+
+@Test func anyDirectoryNamedScopeCaseAndProjectDates() throws {
+    let tree = FixtureTree.build([
+        .dir("Code", [
+            .dir("node_modules", [.file("package", 300 * mb)]),
+        ], modTime: 2_000),
+        .dir("Other", [
+            .dir("node_modules", [.file("package", 350 * mb)]),
+        ], modTime: 3_000),
+        .dir("Capital", [
+            .dir("Build", [.file("artifact", 500 * mb)]),
+        ], modTime: 4_000),
+        .dir(".Trash", [
+            .dir("node_modules", [.file("package", 500 * mb)]),
+        ]),
+        .dir("Library", [
+            .dir("Developer", [
+                .dir("Xcode", [
+                    .dir("DerivedData", [
+                        .dir("proj", [
+                            .dir("Build", [.file("artifact", 500 * mb)]),
+                        ]),
+                    ]),
+                ]),
+            ]),
+        ]),
+        .bundle("Foo.bundle", [
+            .dir("node_modules", [.file("package", 500 * mb)]),
+        ]),
+    ])
+    let rule = try #require(RuleTable.all.first { $0.id == "developer.buildOutputs" })
+    let result = RuleEngine(rules: [rule]).evaluate(tree: tree, homePath: home)
+    let insight = try #require(result.insights.first)
+    #expect(insight.nodeIDs.count == 2)
+    #expect(insight.children.count == 2)
+    #expect(insight.children.first?.bytes == 350 * mb)
+    #expect(insight.children.first?.projectModTime == 3_000)
+    #expect(insight.childrenByProjectDate.count == 2)
+    #expect(insight.childrenByProjectDate.first?.projectModTime == 3_000)
+    #expect(insight.childrenByProjectDate.last?.projectModTime == 2_000)
+}
+
+@Test func anyDirectoryNamedSkipsClaimedSubtrees() throws {
+    let tree = FixtureTree.build([
+        .dir("Claimed", [
+            .dir("node_modules", [.file("package", 400 * mb)]),
+        ]),
+    ])
+    let claimRule = Rule(
+        id: "claim",
+        title: "Claimed folder",
+        detail: "",
+        patterns: [.home("Claimed")],
+        risk: .review,
+        action: .revealOnly
+    )
+    let buildRule = try #require(RuleTable.all.first { $0.id == "developer.buildOutputs" })
+    let result = RuleEngine(rules: [claimRule, buildRule])
+        .evaluate(tree: tree, homePath: home)
+    #expect(result.insights.count == 1)
+    #expect(result.insights.first?.id.hasPrefix("claim:") == true)
 }
 
 @Test func nodeModulesBelowMinimumIsIgnored() {
@@ -176,7 +260,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             .dir("app", [.dir("node_modules", [.file("package", 150 * mb)])]),
         ]),
     ])
-    #expect(insights(tree).contains(where: { $0.id == "developer.buildOutputs" }) == false)
+    #expect(containsInsight(insights(tree), "developer.buildOutputs") == false)
 }
 
 @Test func downloadsSpecialRuleMatchesLargeFilesAndInstallers() throws {
@@ -191,11 +275,68 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             .file("small.txt", 10 * mb),
         ]),
     ])
-    let insight = try #require(insights(tree).first { $0.id == "downloads" })
+    let insight = try #require(find(insights(tree), "downloads"))
     #expect(insight.bytes == 640 * mb)
     #expect(insight.nodeIDs.count == 5)
     #expect(insight.risk == .review)
     #expect(insight.action == .trash)
+}
+
+@Test func overlappingRulesDoNotDoubleCountHomebrew() throws {
+    let tree = FixtureTree.build([
+        .dir("Library", [
+            .dir("Caches", [
+                .dir("Homebrew", [.file("bottle", 500 * mb)]),
+                .dir("com.example.other", [.file("cache", 300 * mb)]),
+            ]),
+        ]),
+    ])
+    let evaluation = RuleEngine().evaluate(tree: tree, homePath: home)
+    let homebrew = try #require(
+        evaluation.insights.first { $0.id.hasPrefix("packageCache.homebrew:") }
+    )
+    let caches = try #require(
+        evaluation.insights.first { $0.id.hasPrefix("userCaches:") }
+    )
+    #expect(homebrew.bytes == 500 * mb)
+    #expect(caches.bytes == 300 * mb)
+    #expect(caches.nodeIDs.count == 1)
+    #expect(Reclaimable.safeBytes(insights: evaluation.insights, tree: tree) == 800 * mb)
+}
+
+@Test func laterRuleSubtractsClaimedDescendants() throws {
+    let tree = FixtureTree.build([
+        .dir("Library", [
+            .dir("Caches", [
+                .dir("Homebrew", [.file("bottle", 500 * mb)]),
+                .dir("com.example.other", [.file("cache", 300 * mb)]),
+            ]),
+        ]),
+    ])
+    let specific = Rule(
+        id: "specific",
+        title: "Homebrew",
+        detail: "",
+        patterns: [.home("Library/Caches/Homebrew")],
+        risk: .safe,
+        action: .trash
+    )
+    let parent = Rule(
+        id: "parent",
+        title: "Caches",
+        detail: "",
+        patterns: [.home("Library/Caches")],
+        risk: .safe,
+        action: .trash
+    )
+    let result = RuleEngine(rules: [specific, parent])
+        .evaluate(tree: tree, homePath: home)
+    let parentInsight = try #require(
+        result.insights.first { $0.id.hasPrefix("parent:") }
+    )
+    #expect(parentInsight.bytes == 300 * mb)
+    let cachesNode = try #require(tree.node(atPath: home + "/Library/Caches"))
+    #expect(parentInsight.nodeIDs == [cachesNode])
 }
 
 @Test func copyCommandsAreData() {
@@ -215,7 +356,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
         ]),
         .dir("Users", [.dir("tester", [])]),
     ])
-    let insight = try #require(insights(tree).first { $0.id == "swap" })
+    let insight = try #require(find(insights(tree), "swap"))
     #expect(insight.action == .displayOnly)
     #expect(insight.risk == .careful)
 }
@@ -229,7 +370,7 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             ]),
         ]),
     ])
-    let insight = try #require(insights(tree).first { $0.id == "vms" })
+    let insight = try #require(find(insights(tree), "vms"))
     #expect(insight.bytes == 1500 * mb)
     #expect(insight.nodeIDs.count == 2)
 }
@@ -244,6 +385,8 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
             ]),
         ]),
     ])
-    let insight = try #require(insights(tree, homePath: home + "/").first { $0.id == "xcode.derivedData" })
+    let insight = try #require(
+        find(insights(tree, homePath: home + "/"), "xcode.derivedData")
+    )
     #expect(insight.bytes == 300 * mb)
 }

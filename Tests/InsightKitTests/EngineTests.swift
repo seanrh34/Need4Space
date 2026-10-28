@@ -22,8 +22,8 @@ private let gb = Size.gb
                 ]),
             ]),
             .dir("Caches", [
-                .dir("com.example.a", [.file("data", 150 * mb)]),
-                .dir("com.example.b", [.file("data", 150 * mb)]),
+                .dir("com.example.a", [.file("data", 250 * mb)]),
+                .dir("com.example.b", [.file("data", 300 * mb)]),
             ]),
             .dir("Application Support", [
                 .dir("Bar", [.file("data", 50 * mb)]),
@@ -55,15 +55,14 @@ private let gb = Size.gb
         now: now
     )
 
-    let ids = Set(report.insights.map(\.id))
-    #expect(ids.contains("trash"))
-    #expect(ids.contains("xcode.derivedData"))
-    #expect(ids.contains("userCaches"))
-    #expect(ids.contains("hidden.space"))
-    #expect(ids.contains(where: { $0.hasPrefix("largeFolder.") }))
-    #expect(ids.contains(where: { $0.hasPrefix("staleFile.") }))
+    #expect(report.insights.contains(where: { $0.id.hasPrefix("trash:") }))
+    #expect(report.insights.contains(where: { $0.id.hasPrefix("xcode.derivedData:") }))
+    #expect(report.insights.contains(where: { $0.id.hasPrefix("userCaches:") }))
+    #expect(report.insights.contains(where: { $0.id.hasPrefix("hidden.space:") }))
+    #expect(report.insights.contains(where: { $0.id.hasPrefix("largeFolder:") }))
+    #expect(report.insights.contains(where: { $0.id.hasPrefix("staleFile:") }))
 
-    #expect(report.reclaimableSafeBytes == 850 * mb)
+    #expect(report.reclaimableSafeBytes == 1100 * mb)
     #expect(report.hidden.gapBytes > 0)
     #expect(report.hidden.blockedCount == 1)
 
@@ -80,7 +79,7 @@ private let gb = Size.gb
     ])
     let report = InsightEngine().run(tree: tree, homePath: home)
     #expect(report.hidden.gapBytes == 0)
-    #expect(report.insights.contains(where: { $0.id == "hidden.space" }) == false)
+    #expect(report.insights.contains(where: { $0.id.hasPrefix("hidden.space:") } == false))
     #expect(report.reclaimableSafeBytes == 300 * mb)
 }
 
@@ -90,7 +89,77 @@ private let gb = Size.gb
         .dir("Downloads", [.file("huge.dmg", 1 * gb)]),
     ])
     let report = InsightEngine().run(tree: tree, homePath: home)
-    #expect(report.insights.first?.id == "trash")
+    #expect(report.insights.first?.id.hasPrefix("trash:") == true)
+}
+
+@Test func engineProtectsStaleFilesInsideCarefulRulesAndBundles() {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let nowSeconds = Int64(now.timeIntervalSince1970)
+    let day: Int64 = 86_400
+    let tree = FixtureTree.build([
+        .dir("Library", [
+            .dir("Mail", [
+                .dir("Inbox.mbox", [
+                    .file("old.eml", 600 * mb, modTime: nowSeconds - 400 * day),
+                ]),
+            ]),
+        ]),
+        .dir("Applications", [
+            .bundle("Foo.app", [
+                .dir("Contents", [
+                    .file("old.bin", 600 * mb, modTime: nowSeconds - 400 * day),
+                ]),
+            ]),
+        ]),
+    ])
+    let report = InsightEngine().run(tree: tree, homePath: home, now: now)
+    let stale = report.insights.filter { $0.id.hasPrefix("staleFile:") }
+    #expect(stale.count == 1)
+    #expect(stale.first?.risk == .careful)
+    #expect(stale.first?.action == .revealOnly)
+}
+
+@Test func engineUsesDisplayOnlyForStaleFileInsideSwap() {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let nowSeconds = Int64(now.timeIntervalSince1970)
+    let day: Int64 = 86_400
+    let tree = FixtureTree.build(rootPath: "/", [
+        .dir("private", [
+            .dir("var", [
+                .dir("vm", [
+                    .file("swapfile0", 900 * mb, modTime: nowSeconds - 400 * day),
+                ]),
+            ]),
+        ]),
+        .dir("Users", [.dir("tester", [])]),
+    ])
+    let report = InsightEngine().run(tree: tree, homePath: home, now: now)
+    let stale = report.insights.filter { $0.id.hasPrefix("staleFile:") }
+    #expect(stale.count == 1)
+    #expect(stale.first?.risk == .careful)
+    #expect(stale.first?.action == .displayOnly)
+}
+
+@Test func hiddenInsightDetailListsSnapshots() throws {
+    let tree = FixtureTree.build([
+        .file("data", 1 * gb),
+    ])
+    let volume = VolumeInfo(
+        mountPath: "/",
+        totalBytes: 100 * gb,
+        usedBytes: 10 * gb,
+        freeBytes: 90 * gb,
+        snapshots: [
+            LocalSnapshot(name: "a"),
+            LocalSnapshot(name: "b", bytes: 2 * gb),
+        ]
+    )
+    let report = InsightEngine().run(tree: tree, homePath: home, volume: volume)
+    let hiddenInsight = try #require(
+        report.insights.first { $0.id.hasPrefix("hidden.space:") }
+    )
+    #expect(hiddenInsight.detail.contains("Local snapshots: 2"))
+    #expect(hiddenInsight.detail.contains("with known sizes"))
 }
 
 @Test func categoriesClassifyCommonPaths() throws {

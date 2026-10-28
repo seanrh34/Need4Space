@@ -48,7 +48,8 @@ public struct InsightEngine: Sendable {
                 tree: tree,
                 now: now,
                 homePath: home,
-                config: config
+                config: config,
+                protected: ruleEvaluation.protected
             )
         )
         insights.append(
@@ -61,7 +62,7 @@ public struct InsightEngine: Sendable {
         )
 
         let hidden = HiddenSpace.compute(tree: tree, volume: volume, blocked: blocked)
-        if let hiddenInsight = Self.hiddenInsight(hidden) {
+        if let hiddenInsight = Self.hiddenInsight(hidden, rootPath: tree.rootPath) {
             insights.append(hiddenInsight)
         }
 
@@ -76,22 +77,26 @@ public struct InsightEngine: Sendable {
         )
     }
 
-    private static func hiddenInsight(_ hidden: HiddenSpace) -> Insight? {
+    private static func hiddenInsight(_ hidden: HiddenSpace, rootPath: String) -> Insight? {
         guard hidden.gapBytes > 0 || hidden.overcountBytes > 0 else { return nil }
 
         let detail: String
         if hidden.overcountBytes > 0 {
             detail = "The scan found more bytes than the volume reports as used (APFS clones). "
-                + "Overcount: \(Self.formatBytes(hidden.overcountBytes))."
+                + "Overcount: \(Self.formatBytes(hidden.overcountBytes)). "
+                + "Local snapshots: \(hidden.snapshotCount) "
+                + "(\(Self.formatBytes(hidden.snapshotKnownBytes)) with known sizes)."
         } else {
             detail = "Used by the volume but not seen by the scan: \(Self.formatBytes(hidden.gapBytes)). "
                 + "Purgeable: \(Self.formatBytes(hidden.purgeableBytes)). "
+                + "Local snapshots: \(hidden.snapshotCount) "
+                + "(\(Self.formatBytes(hidden.snapshotKnownBytes)) with known sizes). "
                 + "Blocked folders: \(hidden.blockedCount). "
                 + "Remainder: \(Self.formatBytes(hidden.remainderBytes)) (\(HiddenSpace.remainderLabel))."
         }
 
         return Insight(
-            id: "hidden.space",
+            id: "hidden.space:\(PathSupport.normalize(rootPath))",
             title: "Hidden space",
             detail: detail,
             nodeIDs: [],

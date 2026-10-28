@@ -102,6 +102,13 @@ extension ScanTree {
         return false
     }
 
+    func nameEqualsAnyExact(_ id: NodeID, _ candidates: [[UInt8]]) -> Bool {
+        for candidate in candidates {
+            if nameEquals(id, candidate) { return true }
+        }
+        return false
+    }
+
     func nameHasSuffixIgnoringCase(_ id: NodeID, _ suffix: [UInt8]) -> Bool {
         let start = nameStart(id)
         let len = nameLen(id)
@@ -155,6 +162,30 @@ extension ScanTree {
                 }
             }
             child = nextSibling[Int(child)]
+        }
+        return nil
+    }
+
+    /// Cross-tree lookup: finds the child of `otherParent` in `tree` whose name equals the name of
+    /// `id` in `tree`. Used by fast growers to walk the current and previous scans in parallel.
+    func childMatchingNameIn(
+        _ other: ScanTree,
+        of otherParent: NodeID,
+        nameOf id: NodeID
+    ) -> NodeID? {
+        let wantedStart = nameStart(id)
+        let wantedLen = nameLen(id)
+        guard wantedLen > 0 else { return nil }
+        let wanted = nameArena[wantedStart..<wantedStart + wantedLen]
+        var child = other.firstChild[Int(otherParent)]
+        while child >= 0 {
+            if other.nameLen(child) == wantedLen {
+                let start = other.nameStart(child)
+                if other.nameArena[start..<start + wantedLen].elementsEqual(wanted) {
+                    return child
+                }
+            }
+            child = other.nextSibling[Int(child)]
         }
         return nil
     }
