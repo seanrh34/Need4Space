@@ -32,8 +32,23 @@ public struct ScanStats: Sendable, Hashable, Codable {
     public var filesSeen: Int = 0
     public var hardLinksDeduplicated: Int = 0
     public var mountPointsSkipped: Int = 0
+    /// Paths of skipped mount points (capped; see scanner). Added in M1 (revision 1).
+    public var skippedMountPaths: [String] = []
     public var peakResidentBytes: UInt64 = 0
     public init() {}
+}
+
+/// A directory that could not be read completely: an open or getattrlistbulk failure
+/// other than EPERM/EACCES (those become blocked nodes), or a failed open inside the
+/// /private/var/vm walk. Children read so far are kept; this subtree's totals may be
+/// undercounts and must not be presented as complete (review round 2 fix 7).
+public struct IncompleteDir: Sendable, Hashable {
+    public var nodeID: NodeID
+    public var errno: Int32
+    public init(nodeID: NodeID, errno: Int32) {
+        self.nodeID = nodeID
+        self.errno = errno
+    }
 }
 
 /// Immutable result of a completed scan.
@@ -46,10 +61,13 @@ public struct ScanResult: Sendable {
     public var stats: ScanStats
     /// FSEvents id at scan start (M5); nil if not recorded.
     public var lastEventID: UInt64?
+    /// Directories whose contents are known to be incomplete (review round 2 fix 7).
+    public var incomplete: [IncompleteDir]
     public init(tree: ScanTree, blocked: [NodeID], volume: VolumeInfo?, scannedAt: Date,
-                stats: ScanStats, lastEventID: UInt64? = nil) {
+                stats: ScanStats, lastEventID: UInt64? = nil, incomplete: [IncompleteDir] = []) {
         self.tree = tree; self.blocked = blocked; self.volume = volume
         self.scannedAt = scannedAt; self.stats = stats; self.lastEventID = lastEventID
+        self.incomplete = incomplete
     }
 
     public var scannedTotalBytes: UInt64 { tree.count > 0 ? tree.allocSize[0] : 0 }

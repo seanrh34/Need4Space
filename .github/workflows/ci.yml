@@ -21,7 +21,7 @@ jobs:
       - name: Build (debug)
         run: swift build
       - name: Test
-        run: swift test
+        run: swift test --no-parallel
       - name: Build (release)
         run: swift build -c release
       - name: Scanner benchmark smoke run
@@ -29,4 +29,9 @@ jobs:
           if [ -f .build/release/n4s-scan ]; then
             .build/release/n4s-scan /Applications --top 10 || true
             .build/release/n4s-scan "$HOME" --top 10 || true
+          fi
+      - name: Accuracy vs du (spec §10)
+        run: |
+          if [ -x scripts/accuracy.sh ] || [ -f scripts/accuracy.sh ]; then
+            sh scripts/accuracy.sh "$HOME/.dotnet" "$HOME/Library/Android/sdk/ndk" "$HOME/hostedtoolcache" /Applications/Xcode_16.app "$HOME/Library" || true
           fi
