@@ -351,7 +351,7 @@ extension ParallelScanner {
 
         // Enqueue the root job; workers start below, after the continuation is stored.
         core.withLock { core in
-            core.queues[0].append(DirJob(nodeID: 0, path: options.root))
+            core.queues[0].append(0) // root node; workers build paths when they pop a job
             core.startedAt = start
         }
 
@@ -534,7 +534,7 @@ extension ParallelScanner {
     ) -> ScanResult? {
         if cancelFlag.load(ordering: .acquiring) { return nil }
 
-        resolveHardLinks(builder: &builder)
+        Self.resolveHardLinks(builder: &builder)
 
         if varVMRequested.load(ordering: .relaxed) {
             let totals = Self.scanDirectorySequentially(
@@ -889,7 +889,7 @@ extension ParallelScanner {
         while cur >= 0 {
             let i = Int(cur)
             // Absent from inFlight = already finalized, or a leaf that never takes part.
-            guard let state = b.inFlight[i] else { break }
+            guard let state = b.inFlight[cur] else { break }
             let k = b.tree.kind[i]
             guard k == .directory || k == .bundle || k == .blocked else { break }
             guard state.listingDone, state.pendingChildDirs == 0 else { break }
@@ -906,7 +906,7 @@ extension ParallelScanner {
             b.tree.allocSize[i] = alloc
             b.tree.logicalSize[i] = logical
             b.tree.fileCount[i] = files
-            b.inFlight[i] = nil
+            b.inFlight[cur] = nil
             b.pendingDirs -= 1
             let parent = b.tree.parent[i]
             if parent >= 0 {
