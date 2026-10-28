@@ -13,17 +13,18 @@ private enum FixtureError: Error {
 }
 
 private struct DeviceKey: Hashable {
-    let dev: UInt32
+    let dev: Int32
     let ino: UInt64
 }
 
 private struct StatInfo {
-    var dev: UInt32
+    var dev: Int32
     var ino: UInt64
     var nlink: UInt64
     var blocks: UInt64
     var size: UInt64
-    var mode: Int32
+    var isDir: Bool
+    var isRegular: Bool
     var mtime: Int64
 }
 
@@ -32,10 +33,14 @@ private func statOf(_ path: String) throws -> StatInfo {
     guard lstat(path, &st) == 0 else {
         throw FixtureError.statFailed(path)
     }
+    // S_IFMT/S_IFDIR/S_IFREG are mode_t (UInt16) on Darwin; st_mtimespec.tv_sec is the
+    // seconds field (stat has no st_mtime member in Swift).
     return StatInfo(
-        dev: st.st_dev, ino: st.st_ino, nlink: UInt64(st.st_nlink),
+        dev: st.st_dev, ino: st.st_ino, nlink: st.st_nlink,
         blocks: UInt64(st.st_blocks), size: UInt64(st.st_size),
-        mode: Int32(st.st_mode), mtime: Int64(st.st_mtime))
+        isDir: st.st_mode & S_IFMT == S_IFDIR,
+        isRegular: st.st_mode & S_IFMT == S_IFREG,
+        mtime: st.st_mtimespec.tv_sec)
 }
 
 private func allocOf(_ path: String) throws -> UInt64 {
@@ -47,6 +52,11 @@ private func makeTempDir(_ prefix: String) throws -> URL {
         .appendingPathComponent("n4s-\(prefix)-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
+}
+
+private func makeDir(_ path: String) throws {
+    try FileManager.default.createDirectory(
+        atPath: path, withIntermediateDirectories: true)
 }
 
 private func writeFile(_ path: String, _ size: Int) throws {
@@ -72,9 +82,9 @@ private func expectedTotals(_ rootPath: String) throws -> (alloc: UInt64, files:
         for entry in try fm.contentsOfDirectory(atPath: path) {
             let full = path == "/" ? "/" + entry : path + "/" + entry
             let st = try statOf(full)
-            if st.mode & S_IFMT == S_IFDIR {
+            if st.isDir {
                 try visit(full)
-            } else if st.mode & S_IFMT == S_IFREG {
+            } else if st.isRegular {
                 files += 1
                 if st.nlink > 1 {
                     let key = DeviceKey(dev: st.dev, ino: st.ino)
@@ -105,8 +115,8 @@ struct FixtureScanTests {
     @Test func nestedDirsAndFilesExactTotals() async throws {
         let root = try makeTempDir("nested")
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(atPath: child(root, "a"))
-        try FileManager.default.createDirectory(atPath: child(root, "b", "empty"))
+        try makeDir(child(root, "a"))
+        try makeDir(child(root, "b", "empty"))
         try writeFile(child(root, "a", "big1.bin"), 1_500_000)
         try writeFile(child(root, "a", "small1.txt"), 5_000)
         try writeFile(child(root, "a", "small2.txt"), 7_000)
@@ -122,7 +132,8 @@ struct FixtureScanTests {
 
         let a = try #require(tree.node(atPath: child(root, "a")))
         #expect(tree.kind[Int(a)] == .directory)
-        #expect(tree.allocSize[Int(a)] == try expectedTotals(child(root, "a")).alloc)
+        let expectedA = try expectedTotals(child(root, "a")).alloc
+        #expect(tree.allocSize[Int(a)] == expectedA)
 
         let empty = try #require(tree.node(atPath: child(root, "b", "empty")))
         #expect(tree.kind[Int(empty)] == .directory)
@@ -147,8 +158,8 @@ struct FixtureScanTests {
     @Test func hardLinkPairInSiblingFoldersCountedOnceWithStableOwner() async throws {
         let root = try makeTempDir("hardlink")
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(atPath: child(root, "h1"))
-        try FileManager.default.createDirectory(atPath: child(root, "h2"))
+        try makeDir(child(root, "h1"))
+        try makeDir(child(root, "h2"))
         try writeFile(child(root, "h1", "alpha.bin"), 1_000_000)
         #expect(link(child(root, "h1", "alpha.bin"), child(root, "h2", "alpha.bin")) == 0)
         try writeFile(child(root, "h2", "small.txt"), 3_000)
@@ -179,8 +190,8 @@ struct FixtureScanTests {
     @Test func hardLinkedSmallFileIsOwnedBySmallerSiblingGroup() async throws {
         let root = try makeTempDir("smalllink")
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(atPath: child(root, "g1"))
-        try FileManager.default.createDirectory(atPath: child(root, "g2"))
+        try makeDir(child(root, "g1"))
+        try makeDir(child(root, "g2"))
         try writeFile(child(root, "g1", "tiny.bin"), 2_000)
         #expect(link(child(root, "g1", "tiny.bin"), child(root, "g2", "tiny.bin")) == 0)
 
@@ -256,8 +267,8 @@ struct FixtureScanTests2 {
             _ = chmod(child(root, "secret"), 0o755)
             try? FileManager.default.removeItem(at: root)
         }
-        try FileManager.default.createDirectory(atPath: child(root, "secret"))
-        try FileManager.default.createDirectory(atPath: child(root, "open"))
+        try makeDir(child(root, "secret"))
+        try makeDir(child(root, "open"))
         try writeFile(child(root, "open", "readme.txt"), 5_000)
         #expect(chmod(child(root, "secret"), 0o000) == 0)
 
@@ -280,7 +291,7 @@ struct FixtureScanTests2 {
     @Test func smallFileGroupingSkipsArchivesAndLargeFiles() async throws {
         let root = try makeTempDir("grouping")
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(atPath: child(root, "data"))
+        try makeDir(child(root, "data"))
         try writeFile(child(root, "data", "s1.txt"), 1_000)
         try writeFile(child(root, "data", "s2.txt"), 2_000)
         try writeFile(child(root, "data", "s3.txt"), 3_000)
@@ -294,15 +305,16 @@ struct FixtureScanTests2 {
         let group = try #require(tree.child(of: data, named: "(3 small files)"))
         #expect(tree.kind[Int(group)] == .smallFilesGroup)
         #expect(tree.fileCount[Int(group)] == 3)
-        let expectedGroup = try allocOf(child(root, "data", "s1.txt"))
-            + try allocOf(child(root, "data", "s2.txt"))
-            + try allocOf(child(root, "data", "s3.txt"))
-        #expect(tree.allocSize[Int(group)] == expectedGroup)
+        let s1 = try allocOf(child(root, "data", "s1.txt"))
+        let s2 = try allocOf(child(root, "data", "s2.txt"))
+        let s3 = try allocOf(child(root, "data", "s3.txt"))
+        #expect(tree.allocSize[Int(group)] == s1 + s2 + s3)
 
         // .zip files are never grouped, whatever their size.
         let zip = try #require(tree.child(of: data, named: "tiny.zip"))
         #expect(tree.kind[Int(zip)] == .file)
-        #expect(tree.allocSize[Int(zip)] == try allocOf(child(root, "data", "tiny.zip")))
+        let zipAlloc = try allocOf(child(root, "data", "tiny.zip"))
+        #expect(tree.allocSize[Int(zip)] == zipAlloc)
 
         let big = try #require(tree.child(of: data, named: "big.bin"))
         #expect(tree.kind[Int(big)] == .file)
@@ -312,8 +324,8 @@ struct FixtureScanTests2 {
     @Test func bundlesDetectedAndScannedInto() async throws {
         let root = try makeTempDir("bundles")
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(atPath: child(root, "MyApp.app", "Contents", "MacOS"))
-        try FileManager.default.createDirectory(atPath: child(root, "Photos.photoslibrary"))
+        try makeDir(child(root, "MyApp.app", "Contents", "MacOS"))
+        try makeDir(child(root, "Photos.photoslibrary"))
         try writeFile(child(root, "MyApp.app", "Contents", "MacOS", "binary"), 100_000)
         try writeFile(child(root, "Photos.photoslibrary", "database.db"), 4_000)
 
@@ -323,11 +335,13 @@ struct FixtureScanTests2 {
         #expect(tree.kind[Int(app)] == .bundle)
         let binary = try #require(tree.node(atPath: child(root, "MyApp.app", "Contents", "MacOS", "binary")))
         #expect(tree.kind[Int(binary)] == .file)
-        #expect(tree.allocSize[Int(app)] == try expectedTotals(child(root, "MyApp.app")).alloc)
+        let appTotal = try expectedTotals(child(root, "MyApp.app")).alloc
+        #expect(tree.allocSize[Int(app)] == appTotal)
 
         let photos = try #require(tree.node(atPath: child(root, "Photos.photoslibrary")))
         #expect(tree.kind[Int(photos)] == .bundle)
-        #expect(result.scannedTotalBytes == try expectedTotals(root.path).alloc)
+        let grandTotal = try expectedTotals(root.path).alloc
+        #expect(result.scannedTotalBytes == grandTotal)
     }
 
     @Test func deepChain200Finalizes() async throws {
@@ -336,7 +350,7 @@ struct FixtureScanTests2 {
         var dir = root.path
         for level in 0..<200 {
             let next = dir + "/d\(level)"
-            try FileManager.default.createDirectory(atPath: next)
+            try makeDir(next)
             dir = next
         }
         try writeFile(dir + "/bottom.bin", 10_000)
@@ -354,7 +368,7 @@ struct FixtureScanTests2 {
     @Test func wideDir10kEntries() async throws {
         let root = try makeTempDir("wide")
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(atPath: child(root, "wide"))
+        try makeDir(child(root, "wide"))
         var smallSum: UInt64 = 0
         for index in 0..<10_000 {
             let path = child(root, "wide", String(format: "f%05d.dat", index))
@@ -371,17 +385,17 @@ struct FixtureScanTests2 {
         let group = try #require(tree.child(of: wide, named: "(10000 small files)"))
         #expect(tree.fileCount[Int(group)] == 10_000)
         #expect(tree.allocSize[Int(group)] == smallSum)
-        #expect(result.scannedTotalBytes == smallSum
-            + try allocOf(child(root, "wide", "big1.bin"))
-            + try allocOf(child(root, "wide", "big2.bin"))
-            + try allocOf(child(root, "wide", "big3.bin")))
+        let big1 = try allocOf(child(root, "wide", "big1.bin"))
+        let big2 = try allocOf(child(root, "wide", "big2.bin"))
+        let big3 = try allocOf(child(root, "wide", "big3.bin"))
+        #expect(result.scannedTotalBytes == smallSum + big1 + big2 + big3)
         #expect(result.stats.filesSeen == 10_003)
     }
 
     @Test func cancellationYieldsCancellationError() async throws {
         let root = try makeTempDir("cancel")
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(atPath: child(root, "d"))
+        try makeDir(child(root, "d"))
         try writeFile(child(root, "d", "file.bin"), 100_000)
 
         let scanner = ParallelScanner(
@@ -421,7 +435,7 @@ struct FixtureScanTests2 {
     @Test func snapshotTreePrunesByDepthAndFraction() async throws {
         let root = try makeTempDir("snapshot")
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(atPath: child(root, "a", "b"))
+        try makeDir(child(root, "a", "b"))
         try writeFile(child(root, "a", "b", "leaf.bin"), 50_000)
         try writeFile(child(root, "top.bin"), 50_000)
 
@@ -466,5 +480,102 @@ struct SnapshotParsingTests {
             "com.apple.TimeMachine.not-a-date.local\ncom.apple.TimeMachine.2026-13-99-999999.local")
         #expect(snapshots.count == 2)
         #expect(snapshots[0].date == nil)
+    }
+}
+
+@Suite("Review round 1 fixes")
+struct ReviewFixTests {
+
+    /// Fix B: a directory holding a chmod-000 child must complete (the blocked child
+    /// drains the parent's pending count instead of wedging the scan).
+    @Test func scanWithBlockedChildDirCompletes() async throws {
+        let root = try makeTempDir("blockedchild")
+        defer {
+            _ = chmod(child(root, "locked"), 0o755)
+            _ = chmod(child(root, "open", "inner"), 0o755)
+            try? FileManager.default.removeItem(at: root)
+        }
+        try makeDir(child(root, "locked"))
+        try makeDir(child(root, "open", "inner"))
+        try writeFile(child(root, "open", "inner", "leaf.bin"), 8_000)
+        try writeFile(child(root, "open", "middle.bin"), 4_000)
+        #expect(chmod(child(root, "locked"), 0o000) == 0)
+
+        // Returns (does not hang) even though the blocked child is pending when its
+        // parent's listing completes.
+        let result = try await runScan(root, threads: 4)
+        let tree = result.tree
+        let leafAlloc = try allocOf(child(root, "open", "inner", "leaf.bin"))
+        let middleAlloc = try allocOf(child(root, "open", "middle.bin"))
+
+        if getuid() != 0 {
+            let locked = try #require(tree.node(atPath: child(root, "locked")))
+            #expect(tree.kind[Int(locked)] == .blocked)
+            #expect(result.blocked.count == 1)
+            #expect(result.scannedTotalBytes == leafAlloc + middleAlloc)
+            let open = try #require(tree.node(atPath: child(root, "open")))
+            #expect(tree.allocSize[Int(open)] == leafAlloc + middleAlloc)
+        }
+    }
+
+    /// Fix G: extension matching is ASCII case-insensitive, so uppercase archives are
+    /// never grouped and uppercase bundles are detected.
+    @Test func uppercaseExtensionsMatch() async throws {
+        let root = try makeTempDir("uppercase")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeDir(child(root, "FOO.APP", "Contents"))
+        try writeFile(child(root, "TINY.ZIP"), 1_000)
+        try writeFile(child(root, "small.dat"), 1_000)
+        try writeFile(child(root, "FOO.APP", "Contents", "exec"), 2_000)
+
+        let result = try await runScan(root)
+        let tree = result.tree
+
+        let app = try #require(tree.node(atPath: child(root, "FOO.APP")))
+        #expect(tree.kind[Int(app)] == .bundle)
+        let exec = try #require(tree.node(atPath: child(root, "FOO.APP", "Contents", "exec")))
+        #expect(tree.kind[Int(exec)] == .file)
+
+        let zip = try #require(tree.child(of: 0, named: "TINY.ZIP"))
+        #expect(tree.kind[Int(zip)] == .file) // own node, never grouped
+        let group = try #require(tree.child(of: 0, named: "(1 small files)"))
+        #expect(tree.fileCount[Int(group)] == 1) // only small.dat
+        #expect(result.stats.filesSeen == 3)
+    }
+
+    /// Fix F: attaching a completed subtree adds its totals exactly once.
+    @Test func attachSubtreeCountsBytesOnce() throws {
+        var b = BuilderState(rootPath: "/", reserveCapacity: 0)
+        let priv = b.appendNode(nameBytes: Array("private".utf8), kind: .directory, parent: 0)
+        _ = b.appendNode(nameBytes: Array("var".utf8), kind: .directory, parent: priv)
+
+        let vm = ParallelScanner.attachSubtree(
+            &b, underPath: "/private/var", name: "vm",
+            alloc: 100, logical: 200, files: 3)
+        let vmID = try #require(vm)
+        #expect(b.tree.allocSize[Int(vmID)] == 100)
+        #expect(b.tree.logicalSize[Int(vmID)] == 200)
+        #expect(b.tree.fileCount[Int(vmID)] == 3)
+        // Ancestors receive the totals exactly once.
+        #expect(b.tree.allocSize[Int(priv)] == 100)
+        #expect(b.tree.allocSize[0] == 100)
+        #expect(b.tree.logicalSize[0] == 200)
+    }
+
+    /// The sequential walker (used for /private/var/vm) matches lstat totals.
+    @Test func sequentialWalkerMatchesStatTotals() async throws {
+        let root = try makeTempDir("seqwalk")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeDir(child(root, "sub"))
+        try writeFile(child(root, "a.bin"), 10_000)
+        try writeFile(child(root, "sub", "b.bin"), 20_000)
+        try FileManager.default.createSymbolicLink(
+            atPath: child(root, "loopA"), withDestinationPath: "loopB")
+
+        let totals = ParallelScanner.scanDirectorySequentially(path: root.path)
+        let expected = try expectedTotals(root.path)
+        #expect(totals != nil)
+        #expect(totals?.alloc == expected.alloc)
+        #expect(totals?.files == expected.files)
     }
 }
