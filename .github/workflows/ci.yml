@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      - name: No permanent-delete APIs in app sources
+        run: |
+          if grep -RInE 'removeItem\(|unlink\(|rmdir\(|unlinkat\(|"rm |emptyTrash' Sources/; then
+            echo "Permanent-delete API found in Sources/"; exit 1
+          fi
+      - name: Build (debug)
+        run: swift build
+      - name: Test
+        run: swift test
+      - name: Build (release)
+        run: swift build -c release
+      - name: Scanner benchmark smoke run
+        run: |
+          if [ -f .build/release/n4s-scan ]; then
+            .build/release/n4s-scan /Applications --top 10 || true
+            .build/release/n4s-scan "$HOME" --top 10 || true
+          fi
