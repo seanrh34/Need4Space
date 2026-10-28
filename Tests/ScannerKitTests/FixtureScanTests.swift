@@ -585,3 +585,46 @@ struct ReviewFixTests {
         #expect(totals?.files == expected.files)
     }
 }
+
+@Suite("Memory budget", .serialized)
+struct MemoryBudgetTests {
+
+    /// Budget guard (review round 2 fix 9): scanning ~200k file nodes must keep peak RSS
+    /// growth under ~60 MB (~300 B/node). Measured with getrusage's ru_maxrss high-water
+    /// mark, so the fixture is built first and growth is taken across scanner init + scan.
+    /// CI runs tests serially, so concurrent suites do not inflate the measurement.
+    @Test func peakRSSGrowthStaysUnder60MBFor200kNodes() async throws {
+        let root = try makeTempDir("budget")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let dirCount = 200
+        let filesPerDir = 1_000
+        for d in 0..<dirCount {
+            let dir = child(root, String(format: "d%03d", d))
+            try makeDir(dir)
+            for f in 0..<filesPerDir {
+                try writeFile(child(dir, String(format: "f%04d", f)), 0)
+            }
+        }
+
+        let rssBefore = MemoryInfo.peakResidentBytes()
+
+        // smallFileThreshold: 0 makes every file its own node — this is a node-count
+        // test, not a byte-count test (zero-byte files, no disk pressure).
+        let scanner = ParallelScanner(
+            options: ScanOptions(
+                root: root.path, threadCount: 4, smallFileThreshold: 0,
+                reserveCapacity: 1 << 16, measureVolumeInfo: false))
+        let result = try await scanner.scan()
+
+        let rssAfter = MemoryInfo.peakResidentBytes()
+        let growth = rssAfter > rssBefore ? rssAfter - rssBefore : 0
+        let nodes = result.tree.count
+        let bytesPerNode = Double(growth) / Double(max(nodes, 1))
+        print(String(
+            format: "memory budget: %d nodes, peak RSS growth %.1f MB (%.0f B/node)",
+            nodes, Double(growth) / 1_048_576.0, bytesPerNode))
+
+        #expect(nodes >= 200_000)
+        #expect(growth < 60 * 1024 * 1024)
+    }
+}
