@@ -1,8 +1,11 @@
 import Testing
+import Darwin
+import Foundation
 @testable import ScannerKit
 
 // Pure parser tests: hand-built getattrlistbulk buffers (little-endian, matching the
-// packed record layout documented in DirectoryReader.parseAttrBuffer).
+// packed record layout documented in DirectoryReader.parseAttrBuffer and pinned by the
+// hard-coded-offset test below).
 
 private func le32(_ v: UInt32) -> [UInt8] {
     withUnsafeBytes(of: v) { Array($0) }
@@ -12,9 +15,23 @@ private func le64(_ v: UInt64) -> [UInt8] {
     withUnsafeBytes(of: v) { Array($0) }
 }
 
+private func le32at(_ b: [UInt8], _ o: Int) -> UInt32 {
+    UInt32(b[o]) | UInt32(b[o + 1]) << 8 | UInt32(b[o + 2]) << 16 | UInt32(b[o + 3]) << 24
+}
+
+private func le64at(_ b: [UInt8], _ o: Int) -> UInt64 {
+    var v: UInt64 = 0
+    for i in 0..<8 {
+        v |= UInt64(b[o + i]) << (8 * UInt64(i))
+    }
+    return v
+}
+
 /// Builds one record exactly the way the kernel packs it under FSOPT_PACK_INVAL_ATTRS:
-/// [len u32][attribute_set_t 20][error u32?][common attrs ascending][file attrs ascending]
-/// [variable name data]. Fields whose bit is cleared are packed as zero placeholders.
+/// [len u32][attribute_set_t 20][error u32?][common attrs ascending]
+/// [file attrs ascending][variable name data]. Fields whose bit is cleared are packed as
+/// zero placeholders. With the SDK constants the common order is NAME, DEVID, OBJTYPE,
+/// MODTIME, ACCTIME, FILEID; file order is LINKCOUNT, ALLOCSIZE, DATALENGTH.
 private func record(
     name: String? = "entry.txt",
     objType: UInt32? = Attr.ObjType.vreg,
@@ -61,10 +78,11 @@ private func record(
     let nameData = name.map { Array($0.utf8) } ?? []
     let attrRefPos = b.count
     if name != nil {
-        // Compute after we know the gap; patch below. Reserve the slot now.
+        // Patched once the data position is known; reserve the slot now.
         b.append(contentsOf: le32(0)) // offset placeholder
         b.append(contentsOf: le32(UInt32(nameData.count + 1))) // length incl. NUL
     }
+    if devid != nil { b.append(contentsOf: le32(UInt32(bitPattern: devid!))) }
     if objType != nil { b.append(contentsOf: le32(objType!)) }
     if modTime != nil {
         b.append(contentsOf: le64(UInt64(bitPattern: modTime!)))
@@ -75,7 +93,6 @@ private func record(
         b.append(contentsOf: le64(1))
     }
     if fileID != nil { b.append(contentsOf: le64(fileID!)) }
-    if devid != nil { b.append(contentsOf: le32(UInt32(bitPattern: devid!))) }
     if linkCount != nil { b.append(contentsOf: le32(linkCount!)) }
     if alloc != nil { b.append(contentsOf: le64(alloc!)) }
     if logical != nil { b.append(contentsOf: le64(logical!)) }
@@ -103,7 +120,9 @@ private func record(
 
 private func parse(_ records: [UInt8], count: Int? = nil) -> [RawEntry] {
     let n = count ?? records.count // over-count is fine: records bound the walk
-    return DirectoryReader.parseAttrBuffer(UnsafeRawBufferPointer(records), count: n)
+    return records.withUnsafeBytes { buffer in
+        DirectoryReader.parseAttrBuffer(buffer, count: n)
+    }
 }
 
 @Suite("DirectoryReader.parseAttrBuffer")
@@ -128,6 +147,46 @@ struct ParserTests {
         #expect(e.error == nil)
     }
 
+    /// Pins the packed byte layout to the man-page order given the SDK constants: a wrong
+    /// constant set or a wrong walk order shifts a field and fails here.
+    @Test func recordLayoutMatchesHardCodedByteOffsets() {
+        // [0] len u32 | [4] attr set (20) | [24] NAME ref (8) | [32] DEVID (4)
+        // [36] OBJTYPE (4) | [40] MODTIME (16) | [56] ACCTIME (16) | [72] FILEID (8)
+        // [80] LINKCOUNT (4) | [84] ALLOCSIZE (8) | [92] DATALENGTH (8) | [96] "AB\0"
+        let buf = record(
+            name: "AB", objType: 7, modTime: 111, accTime: 222, fileID: 33,
+            devid: 44, linkCount: 2, alloc: 55, logical: 66)
+        #expect(buf.count == 99)
+        #expect(le32at(buf, 0) == 99) // record length
+        #expect(le32at(buf, 4) == Attr.cmnReturnedAttrs | Attr.cmnName | Attr.cmnDevID
+            | Attr.cmnObjType | Attr.cmnModTime | Attr.cmnAccTime | Attr.cmnFileID)
+        #expect(le32at(buf, 8) == 0) // volattr
+        #expect(le32at(buf, 12) == 0) // dirattr
+        #expect(le32at(buf, 16) == Attr.fileLinkCount | Attr.fileAllocSize | Attr.fileDataLength)
+        #expect(le32at(buf, 20) == 0) // forkattr
+        #expect(le32at(buf, 24) == 96 - 24) // name data offset, relative to the attrref
+        #expect(le32at(buf, 28) == 3) // "AB" + NUL
+        #expect(le32at(buf, 32) == 44) // DEVID
+        #expect(le32at(buf, 36) == 7) // OBJTYPE
+        #expect(Int64(bitPattern: le64at(buf, 40)) == 111) // MODTIME tv_sec
+        #expect(Int64(bitPattern: le64at(buf, 56)) == 222) // ACCTIME tv_sec
+        #expect(le64at(buf, 72) == 33) // FILEID
+        #expect(le32at(buf, 80) == 2) // LINKCOUNT
+        #expect(le64at(buf, 84) == 55) // ALLOCSIZE
+        #expect(le64at(buf, 92) == 66) // DATALENGTH
+
+        let e = parse(buf, count: 1)[0]
+        #expect(e.name == Array("AB".utf8))
+        #expect(e.devid == 44)
+        #expect(e.objType == 7)
+        #expect(e.modTime == 111)
+        #expect(e.accessTime == 222)
+        #expect(e.fileID == 33)
+        #expect(e.linkCount == 2)
+        #expect(e.allocSize == 55)
+        #expect(e.logicalSize == 66)
+    }
+
     @Test func mixedReturnedAttrsLeaveMissingFieldsNil() {
         // Only NAME, OBJTYPE and ALLOCSIZE returned; other requested slots are
         // zero-filled placeholders (FSOPT_PACK_INVAL_ATTRS) and must read as nil.
@@ -149,7 +208,7 @@ struct ParserTests {
     }
 
     @Test func perEntryErrorCarriesNameAndSkipsNothing() {
-        let errRecord = record(name: "denied", error: EPERM, objType: nil)
+        let errRecord = record(name: "denied", objType: nil, error: EPERM)
         let okRecord = record(name: "ok.txt", alloc: 512)
         let entries = parse(errRecord + okRecord, count: 2)
         #expect(entries.count == 2)
@@ -192,7 +251,7 @@ struct ParserTests {
     @Test func nameDataOffsetIsRelativeToTheAttrReference() {
         // 37 filler bytes push the name data past the attrref; the offset stored in the
         // attrreference_t is relative to the field's own address.
-        let buf = record(name: "offset-test", nameGap: 37, alloc: 10)
+        let buf = record(name: "offset-test", alloc: 10, nameGap: 37)
         let entries = parse(buf, count: 1)
         #expect(entries.count == 1)
         #expect(entries[0].name.map { String(decoding: $0, as: UTF8.self) } == "offset-test")
@@ -202,7 +261,7 @@ struct ParserTests {
         // An odd trailing pad makes the NEXT record start at an odd address, so its
         // 8-byte fields are misaligned; loadUnaligned must cope.
         let first = record(name: "odd", trailingPad: [0x00])
-        let second = record(name: "even-after-odd", alloc: 0x1234, fileID: 99)
+        let second = record(name: "even-after-odd", fileID: 99, alloc: 0x1234)
         let entries = parse(first + second, count: 2)
         #expect(entries.count == 2)
         #expect(entries[1].allocSize == 0x1234)
@@ -211,7 +270,7 @@ struct ParserTests {
     }
 
     @Test func emptyRecordListParsesToEmpty() {
-        #expect(DirectoryReader.parseAttrBuffer(UnsafeRawBufferPointer([]), count: 0).isEmpty)
-        #expect(DirectoryReader.parseAttrBuffer(UnsafeRawBufferPointer([1, 2, 3]), count: 4).isEmpty)
+        #expect(parse([], count: 0).isEmpty)
+        #expect(parse([1, 2, 3], count: 4).isEmpty)
     }
 }
