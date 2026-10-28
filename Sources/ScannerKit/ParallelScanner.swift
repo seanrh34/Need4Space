@@ -18,7 +18,8 @@ public struct ScanOptions: Sendable {
     /// If true, entries on other devices are followed; otherwise they become 0-size `.other`
     /// leaves and are recorded as skipped mount points (plan revision 1).
     public var crossMounts: Bool
-    /// Pre-reserved node capacity to avoid copy-on-grow spikes (plan revision 12).
+    /// Pre-reserved node capacity. The default is modest (review round 2 fix 1): arrays
+    /// grow geometrically instead of pre-allocating a 1M-node tree (~70 MB) per scan.
     public var reserveCapacity: Int
     /// Read VolumeInfo (capacity + snapshots) at the end of the scan.
     public var measureVolumeInfo: Bool
@@ -31,7 +32,7 @@ public struct ScanOptions: Sendable {
         smallFileThreshold: UInt64 = 64 * 1024,
         skipPaths: [String] = ScanOptions.defaultSkipPaths,
         crossMounts: Bool = false,
-        reserveCapacity: Int = 1 << 20,
+        reserveCapacity: Int = 1 << 16,
         measureVolumeInfo: Bool = true
     ) {
         self.root = root
@@ -51,24 +52,29 @@ public enum ScanError: Error, Sendable {
     case rootUnreadable(errno: Int32)
 }
 
-/// A pending directory-listing job. Jobs carry (node, absolute path) only — the directory
-/// is OPENED when the job runs, so at most workerCount+1 fds are ever open (a wide tree
-/// cannot hit EMFILE by queueing, review round 1 fix D) and cancellation can never leak
-/// fds in un-run jobs.
+/// A directory-listing task. Queues hold bare node IDs (4 bytes each); a worker builds
+/// the absolute path by walking parents under the lock when it pops the job. The
+/// directory is OPENED when the job runs, so at most workerCount+1 fds are ever open.
+struct QueuedDir: Sendable {
+    let nodeID: NodeID
+}
+
+/// A directory job handed to a worker: node plus its materialized path.
 struct DirJob: Sendable {
     let nodeID: NodeID
     let path: String
 }
 
 /// A regular file seen with linkCount > 1. Bytes are resolved after the walk (revision 8):
-/// the owner is the record with the lexicographically smallest path.
+/// the owner is the record with the lexicographically smallest path. Records carry no
+/// paths (review round 2 fix 3): during resolution one running owner is kept per key and
+/// paths are built only for keys seen more than once.
 struct HardLinkRecord: Sendable {
     let devid: Int32
     let fileID: UInt64
     let nodeID: NodeID
     let alloc: UInt64
     let logical: UInt64
-    let path: String
 }
 
 struct DeviceFileKey: Hashable, Sendable {
@@ -76,26 +82,36 @@ struct DeviceFileKey: Hashable, Sendable {
     let fileID: UInt64
 }
 
-/// A small file (< smallFileThreshold) waiting to be folded into its directory's
-/// smallFilesGroup node at the end of that directory's listing.
-struct SmallFileRecord: Sendable {
-    let name: [UInt8]
-    let alloc: UInt64
-    let logical: UInt64
-    let modTime: Int64
+/// A hard-linked file below the small-file threshold, kept only until its directory's
+/// listing ends (they are rare); the bytes land on the directory's smallFilesGroup node.
+struct LinkedSmall: Sendable {
     let devid: Int32
     let fileID: UInt64
-    let linkCount: UInt32
+    let alloc: UInt64
+    let logical: UInt64
+}
+
+/// Running aggregate of one directory's small files (review round 2 fix 2: individual
+/// small files are never retained until the listing ends; only linked ones are).
+struct SmallAgg: Sendable {
+    var count = 0
+    var alloc: UInt64 = 0
+    var logical: UInt64 = 0
+    var modTime: Int64 = 0
+    var linked: [LinkedSmall] = []
 }
 
 /// Mutable scanner state guarded by the builder Mutex (plan revision 6: mutable state lives
 /// only in Mutex/Atomic; the tree is never shared unlocked).
 struct BuilderState: Sendable {
     var tree: ScanTree
-    /// Per-node side arrays (plan revision 3 + 12), discarded with the builder.
-    var listingDone: [Bool] = []
-    var pendingChildDirs: [Int32] = []
-    var finalized: [Bool] = []
+    /// Completion-protocol state for directories that are created but not yet finalized
+    /// (review round 2 fix 2: nothing per file node; entries are removed on finalize).
+    struct DirState: Sendable {
+        var listingDone = false
+        var pendingChildDirs: Int32 = 0
+    }
+    var inFlight: [NodeID: DirState] = [:]
     var blockedIDs: [NodeID] = []
     var hardLinks: [HardLinkRecord] = []
     var deduplicatedLinks: Int = 0
@@ -109,26 +125,33 @@ struct BuilderState: Sendable {
         self.tree = ScanTree(rootPath: rootPath, reserveCapacity: reserveCapacity)
         let root = tree.addNode(name: "", kind: .directory, parent: ScanTree.none)
         _ = root
-        listingDone.append(false)
-        pendingChildDirs.append(0)
-        finalized.append(false)
+        inFlight[0] = DirState()
         pendingDirs = 1 // root waits for its listing
     }
 
-    /// Appends a node and keeps the side arrays in sync.
+    /// Appends a node. Directory bookkeeping lives in `inFlight` and is created by the
+    /// enqueue site, not here.
     mutating func appendNode(
         nameBytes: some Collection<UInt8>, kind: NodeKind, parent: NodeID,
         allocSize: UInt64 = 0, logicalSize: UInt64 = 0, fileCount: UInt32 = 0,
         modTime: Int64 = 0, accessTime: Int64 = 0
     ) -> NodeID {
-        let id = tree.addNode(
+        tree.addNode(
             nameBytes: nameBytes, kind: kind, parent: parent,
             allocSize: allocSize, logicalSize: logicalSize, fileCount: fileCount,
             modTime: modTime, accessTime: accessTime)
-        listingDone.append(false)
-        pendingChildDirs.append(0)
-        finalized.append(false)
-        return id
+    }
+
+    /// Registers a directory that will be listed (job enqueued): it counts as pending
+    /// until its finalize, and its parent waits for it.
+    mutating func trackDir(_ id: NodeID, parent: NodeID) {
+        inFlight[id] = DirState()
+        pendingDirs += 1
+        inFlight[parent]?.pendingChildDirs += 1
+    }
+
+    mutating func markListingDone(_ id: NodeID) {
+        inFlight[id]?.listingDone = true
     }
 }
 
@@ -136,10 +159,10 @@ struct BuilderState: Sendable {
 /// (`Mutex`) or the Atomic counters on the scanner itself.
 struct ScannerCore: Sendable {
     var builder: BuilderState
-    /// Per-worker deques, shared under the one Mutex. Honest naming (plan revision 6): this
-    /// is a coarse single-lock work-stealing pool (local LIFO pop, FIFO steal from others);
+    /// Per-worker deques of node IDs, shared under the one Mutex. Honest naming (plan
+    /// revision 6): coarse single-lock work-stealing pool (local LIFO pop, FIFO steal);
     /// per-deque locks are a future optimization if benchmarks show contention.
-    var queues: [[DirJob]] = []
+    var queues: [[NodeID]] = []
     /// Jobs popped but not finished.
     var activeJobs = 0
     var done = false
@@ -284,6 +307,26 @@ public final class ParallelScanner: Sendable {
             }
             return -1
         }
+    }
+
+    /// Absolute path of a node by walking parents (review round 2 fix 4). Called with the
+    /// core lock held when a job is popped; one string per directory job, never per file.
+    static func nodePath(_ tree: ScanTree, _ id: NodeID) -> String {
+        if id <= 0 { return tree.rootPath }
+        var slices: [ArraySlice<UInt8>] = []
+        var cur = id
+        while cur > 0 {
+            let i = Int(cur)
+            let start = Int(tree.nameOffset[i])
+            slices.append(tree.nameArena[start..<start + Int(tree.nameLength[i])])
+            cur = tree.parent[i]
+        }
+        var bytes: [UInt8] = tree.rootPath == "/" ? [] : Array(tree.rootPath.utf8)
+        for slice in slices.reversed() {
+            bytes.append(UInt8(ascii: "/"))
+            bytes.append(contentsOf: slice)
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 
@@ -491,23 +534,27 @@ extension ParallelScanner {
     }
 
     /// Pops local work (LIFO) or steals from another deque (FIFO), under the one lock.
+    /// The popped node's path is built here (review round 2 fix 4); queues hold 4-byte
+    /// node IDs only.
     private func nextAction(index: Int) -> WorkerAction {
         core.withLock { core -> WorkerAction in
             if core.done { return .exit(nil) }
             if cancelFlag.load(ordering: .relaxed) {
                 return .exit(completeScanLocked(&core, cancelled: true))
             }
-            if let job = core.queues[index].popLast() {
+            if let id = core.queues[index].popLast() {
+                let path = Self.nodePath(core.builder.tree, id)
                 core.activeJobs += 1
-                return .run(job)
+                return .run(DirJob(nodeID: id, path: path))
             }
             let n = core.queues.count
             var victim = (index + 1) % n
             for _ in 1..<n {
-                if !core.queues[victim].isEmpty {
-                    let job = core.queues[victim].removeFirst()
+                if let id = core.queues[victim].first {
+                    core.queues[victim].removeFirst()
+                    let path = Self.nodePath(core.builder.tree, id)
                     core.activeJobs += 1
-                    return .run(job)
+                    return .run(DirJob(nodeID: id, path: path))
                 }
                 victim = (victim + 1) % n
             }
@@ -522,7 +569,7 @@ extension ParallelScanner {
     // MARK: Processing one directory
 
     private func process(_ job: DirJob, workerIndex: Int, buffer: UnsafeMutableRawPointer) {
-        var smalls: [SmallFileRecord] = []
+        var smalls = SmallAgg()
 
         // The fd lives only for this listing (review fix D/E: nothing is enqueued with
         // an fd, so cancellation can never leak descriptors).
@@ -592,8 +639,8 @@ extension ParallelScanner {
         // Listing finished (failed, cancelled, or done): the directory ALWAYS completes
         // so pending counters stay balanced (review fixes B/C).
         let payload = core.withLock { core -> DeliveryPayload? in
-            core.builder.listingDone[Int(job.nodeID)] = true
-            finalizeSmallGroupLocked(&core.builder, job: job, smalls: smalls)
+            core.builder.markListingDone(job.nodeID)
+            finalizeSmallGroupLocked(&core.builder, job: job, agg: smalls)
             finalizeChainLocked(&core.builder, start: job.nodeID)
             core.activeJobs -= 1
             _ = dirsScanned.add(1, ordering: .relaxed)
@@ -631,7 +678,7 @@ extension ParallelScanner {
     private func appendBatchLocked(
         _ core: inout ScannerCore, job: DirJob, entries: [RawEntry],
         childPaths: [String?], childMarkers: [Int32],
-        workerIndex: Int, smalls: inout [SmallFileRecord]
+        workerIndex: Int, smalls: inout SmallAgg
     ) {
         for i in entries.indices {
             let entry = entries[i]
@@ -675,10 +722,8 @@ extension ParallelScanner {
                     nameBytes: name, kind: isBundle ? NodeKind.bundle : NodeKind.directory,
                     parent: job.nodeID, modTime: entry.modTime ?? 0,
                     accessTime: entry.accessTime ?? 0)
-                core.builder.pendingDirs += 1
-                core.builder.pendingChildDirs[Int(job.nodeID)] += 1
-                core.queues[workerIndex].append(
-                    DirJob(nodeID: id, path: childPaths[i] ?? ""))
+                core.builder.trackDir(id, parent: job.nodeID)
+                core.queues[workerIndex].append(id)
 
             case Attr.ObjType.vlnk:
                 // Symlink: leaf with its own (usually zero) alloc size; never followed.
@@ -693,11 +738,19 @@ extension ParallelScanner {
                 let linkCount = entry.linkCount ?? 1
                 let excluded = Self.neverGroupExtensions.contains { Self.hasExtension(name, $0) }
                 if !excluded, alloc < options.smallFileThreshold {
-                    smalls.append(
-                        SmallFileRecord(
-                            name: name, alloc: alloc, logical: logical,
-                            modTime: entry.modTime ?? 0, devid: entry.devid ?? 0,
-                            fileID: entry.fileID ?? 0, linkCount: linkCount))
+                    // Aggregated per batch (review round 2 fix 2); only linked small files
+                    // are retained, for ownership resolution.
+                    smalls.count += 1
+                    if entry.modTime ?? 0 > smalls.modTime { smalls.modTime = entry.modTime ?? 0 }
+                    if linkCount <= 1 {
+                        smalls.alloc &+= alloc
+                        smalls.logical &+= logical
+                    } else {
+                        smalls.linked.append(
+                            LinkedSmall(
+                                devid: entry.devid ?? 0, fileID: entry.fileID ?? 0,
+                                alloc: alloc, logical: logical))
+                    }
                 } else {
                     var nodeAlloc = alloc
                     var nodeLogical = logical
@@ -710,8 +763,7 @@ extension ParallelScanner {
                         core.builder.hardLinks.append(
                             HardLinkRecord(
                                 devid: entry.devid ?? 0, fileID: entry.fileID ?? 0,
-                                nodeID: id, alloc: alloc, logical: logical,
-                                path: Self.childPath(parent: job.path, name: name)))
+                                nodeID: id, alloc: alloc, logical: logical))
                     }
                 }
                 _ = filesFound.add(1, ordering: .relaxed)
@@ -726,47 +778,39 @@ extension ParallelScanner {
         }
     }
 
-    /// Folds the directory's collected small files into ONE smallFilesGroup node
+    /// Folds the directory's aggregated small files into ONE smallFilesGroup node
     /// (SPEC §4, revision 9). Linked small files contribute 0 bytes here; their bytes
     /// are added after the walk if their record owns the (devid, fileid) group.
     private func finalizeSmallGroupLocked(
-        _ b: inout BuilderState, job: DirJob, smalls: [SmallFileRecord]
+        _ b: inout BuilderState, job: DirJob, agg: SmallAgg
     ) {
-        guard !smalls.isEmpty else { return }
-        var alloc: UInt64 = 0
-        var logical: UInt64 = 0
-        var modTime: Int64 = 0
-        for s in smalls {
-            if s.linkCount <= 1 {
-                alloc &+= s.alloc
-                logical &+= s.logical
-            }
-            if s.modTime > modTime { modTime = s.modTime }
-        }
-        let groupName = "(\(smalls.count) small files)"
+        guard agg.count > 0 else { return }
+        let groupName = "(\(agg.count) small files)"
         let id = b.appendNode(
             nameBytes: Array(groupName.utf8), kind: .smallFilesGroup, parent: job.nodeID,
-            allocSize: alloc, logicalSize: logical, fileCount: UInt32(smalls.count),
-            modTime: modTime)
-        for s in smalls where s.linkCount > 1 {
+            allocSize: agg.alloc, logicalSize: agg.logical, fileCount: UInt32(agg.count),
+            modTime: agg.modTime)
+        for s in agg.linked {
             b.hardLinks.append(
                 HardLinkRecord(
-                    devid: s.devid, fileID: s.fileID, nodeID: id, alloc: s.alloc,
-                    logical: s.logical, path: Self.childPath(parent: job.path, name: s.name)))
+                    devid: s.devid, fileID: s.fileID, nodeID: id,
+                    alloc: s.alloc, logical: s.logical))
         }
     }
 
     /// Directory completion protocol (plan revision 3), iterative: finalize `start` if its
     /// listing is done and no child directories are pending; then decrement the parent's
-    /// pending counter and re-check, walking up until a directory is not ready.
+    /// pending counter and re-check, walking up until a directory is not ready. Finalized
+    /// directories leave `inFlight` entirely (review round 2 fix 2).
     private func finalizeChainLocked(_ b: inout BuilderState, start: NodeID) {
         var cur = start
         while cur >= 0 {
             let i = Int(cur)
-            if b.finalized[i] { break }
+            // Absent from inFlight = already finalized, or a leaf that never takes part.
+            guard let state = b.inFlight[i] else { break }
             let k = b.tree.kind[i]
             guard k == .directory || k == .bundle || k == .blocked else { break }
-            guard b.listingDone[i], b.pendingChildDirs[i] == 0 else { break }
+            guard state.listingDone, state.pendingChildDirs == 0 else { break }
             var alloc: UInt64 = 0
             var logical: UInt64 = 0
             var files: UInt32 = 0
@@ -780,11 +824,11 @@ extension ParallelScanner {
             b.tree.allocSize[i] = alloc
             b.tree.logicalSize[i] = logical
             b.tree.fileCount[i] = files
-            b.finalized[i] = true
+            b.inFlight[i] = nil
             b.pendingDirs -= 1
             let parent = b.tree.parent[i]
             if parent >= 0 {
-                b.pendingChildDirs[Int(parent)] &-= 1
+                b.inFlight[parent]?.pendingChildDirs &-= 1
             }
             cur = parent
         }
@@ -812,21 +856,47 @@ extension ParallelScanner {
 
     // MARK: Post-walk passes
 
-    /// Revision 8: per (devid, fileid) group, the owner is the record with the
-    /// lexicographically smallest path; its bytes are added to it and its ancestors.
+    /// Revision 8: per (devid, fileid) group the owner is the record with the smallest
+    /// path; its bytes are added to it and its ancestors. Records carry no paths (review
+    /// round 2 fix 3): one running owner is kept per key, and paths are built only for
+    /// keys seen more than once. For records attached to a smallFilesGroup node the
+    /// comparison key is the group's node path — deterministic and stable across runs
+    /// (group paths are prefixes of the member file paths).
     private func resolveHardLinksLocked(_ core: inout ScannerCore) {
-        var groups: [DeviceFileKey: [HardLinkRecord]] = [:]
+        struct KeyState {
+            var count = 0
+            var best: HardLinkRecord?
+            var bestPath: String?
+        }
+        var groups: [DeviceFileKey: KeyState] = [:]
         for record in core.builder.hardLinks {
-            groups[DeviceFileKey(devid: record.devid, fileID: record.fileID), default: []]
-                .append(record)
-        }
-        for records in groups.values {
-            if records.count > 1 {
-                core.builder.deduplicatedLinks += records.count - 1
+            let key = DeviceFileKey(devid: record.devid, fileID: record.fileID)
+            var state = groups[key] ?? KeyState()
+            state.count += 1
+            if state.count == 1 {
+                state.best = record
+            } else {
+                if state.bestPath == nil, let best = state.best {
+                    state.bestPath = core.builder.tree.path(best.nodeID)
+                }
+                let path = core.builder.tree.path(record.nodeID)
+                if let bestPath = state.bestPath, path < bestPath {
+                    state.best = record
+                    state.bestPath = path
+                }
             }
-            guard let owner = records.min(by: { $0.path < $1.path }) else { continue }
-            addBytesLocked(&core, nodeID: owner.nodeID, alloc: owner.alloc, logical: owner.logical)
+            groups[key] = state
         }
+        for state in groups.values {
+            if state.count > 1 {
+                core.builder.deduplicatedLinks += state.count - 1
+            }
+            guard let best = state.best else { continue }
+            Self.addBytes(
+                &core.builder.tree, nodeID: best.nodeID,
+                alloc: best.alloc, logical: best.logical)
+        }
+        core.builder.hardLinks.removeAll(keepingCapacity: false)
     }
 
     /// Revision 2: /private/var/vm (firmlinked to the VM volume) is measured recursively
@@ -926,6 +996,11 @@ extension ParallelScanner {
     private func buildResultLocked(_ core: inout ScannerCore) -> ScanResult {
         resolveHardLinksLocked(&core)
         attachVarVMLocked(&core)
+        // The scan is over: drop the cached snapshot so a finished scanner does not pin
+        // a second copy of the tree (review round 2 fix 4).
+        core.snapshotCache = nil
+        core.snapshotKey = nil
+        core.snapshotTime = nil
 
         var stats = ScanStats()
         if let startedAt = core.startedAt {
@@ -945,14 +1020,18 @@ extension ParallelScanner {
             tree: core.builder.tree, blocked: core.builder.blockedIDs, volume: volume,
             scannedAt: Date(), stats: stats, lastEventID: nil)
     }
-
     /// Pruned copy for live UI snapshots (revision 4): nodes down to `maxDepth` whose
     /// subtree allocated size is at least `minFraction` of the root total. Kept nodes
     /// carry their true (current) totals, so a parent's size covers pruned children.
-    static func prunedCopy(_ tree: ScanTree, maxDepth: Int, minFraction: Double) -> ScanTree {
+    /// While the root total is still zero (scan incomplete) the minFraction filter is
+    /// useless, so the copy is capped at `nodeCap` nodes (review round 2 fix 4).
+    static func prunedCopy(
+        _ tree: ScanTree, maxDepth: Int, minFraction: Double, nodeCap: Int = 20_000
+    ) -> ScanTree {
         var copy = ScanTree(rootPath: tree.rootPath)
         guard tree.count > 0 else { return copy }
         let rootAlloc = tree.allocSize[0]
+        let capActive = rootAlloc == 0
         let threshold = UInt64((minFraction * Double(max(rootAlloc, 1))).rounded())
         func nameBytes(_ id: NodeID) -> ArraySlice<UInt8> {
             let start = Int(tree.nameOffset[Int(id)])
@@ -965,8 +1044,10 @@ extension ParallelScanner {
             accessTime: tree.accessTime[0])
         var stack: [(old: NodeID, newParent: NodeID, depth: Int)] = [(0, newRoot, 0)]
         while let (old, newParent, depth) = stack.popLast() {
+            if capActive, copy.count >= nodeCap { break }
             var child = tree.firstChild[Int(old)]
             while child >= 0 {
+                if capActive, copy.count >= nodeCap { break }
                 let ci = Int(child)
                 let childDepth = depth + 1
                 if childDepth <= maxDepth, tree.allocSize[ci] >= threshold {
