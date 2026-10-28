@@ -51,12 +51,12 @@ public enum ScanError: Error, Sendable {
     case rootUnreadable(errno: Int32)
 }
 
-/// A pending directory-listing job. Carries the child's own fd (opened by the parent's
-/// worker via openat, so no path strings are needed to open things) plus its absolute path
-/// for bookkeeping (skip list, mount records) — one string per directory, never per file.
+/// A pending directory-listing job. Jobs carry (node, absolute path) only — the directory
+/// is OPENED when the job runs, so at most workerCount+1 fds are ever open (a wide tree
+/// cannot hit EMFILE by queueing, review round 1 fix D) and cancellation can never leak
+/// fds in un-run jobs.
 struct DirJob: Sendable {
     let nodeID: NodeID
-    let fd: Int32
     let path: String
 }
 
@@ -242,14 +242,16 @@ public final class ParallelScanner: Sendable {
         #endif
     }
 
-    /// lexicographic ASCII-suffix check without allocating a String (e.g. "app" for .app).
+    /// ASCII case-insensitive suffix check without allocating a String (e.g. "app"
+    /// matches .app and .APP): only A-Z are folded (c | 0x20), review fix G.
     static func hasExtension(_ name: [UInt8], _ ext: String) -> Bool {
         let extBytes = Array(ext.utf8)
         let n = name.count, m = extBytes.count
         guard n > m + 1, name[n - m - 1] == UInt8(ascii: ".") else { return false }
         for (i, b) in extBytes.enumerated() {
-            let c = name[n - m + i]
-            if c != b, c != (b & 0x20) { return false } // ASCII letters only
+            var c = name[n - m + i]
+            if c >= UInt8(ascii: "A"), c <= UInt8(ascii: "Z") { c |= 0x20 }
+            if c != b { return false }
         }
         return true
     }
@@ -264,51 +266,76 @@ public final class ParallelScanner: Sendable {
         }
         return parent + "/" + String(decoding: name, as: UTF8.self)
     }
+
+    /// Opens a directory, retrying transient fd-exhaustion instead of dropping the
+    /// subtree (review fix D). Returns -1 with errno set on final failure.
+    static func openDirectory(_ path: String, noFollow: Bool) -> Int32 {
+        var flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC
+        if noFollow { flags |= O_NOFOLLOW }
+        var attempt = 0
+        while true {
+            let fd = open(path, flags)
+            if fd >= 0 { return fd }
+            let err = errno
+            if err == EMFILE || err == ENFILE, attempt < 50 {
+                attempt += 1
+                Thread.sleep(forTimeInterval: 0.02)
+                continue
+            }
+            return -1
+        }
+    }
 }
 
 // MARK: - Scan lifecycle
 
 extension ParallelScanner {
     /// Runs the scan on its own worker threads and suspends until it completes.
-    /// One-shot; cancellation yields `CancellationError`.
+    /// One-shot; cancellation (via `cancel()` or cancelling the calling Task) yields
+    /// `CancellationError`.
     public func scan() async throws -> ScanResult {
         guard startedFlag.compareExchange(
             expected: false, desired: true, ordering: .acquiringAndReleasing).exchanged
         else { throw ScanError.alreadyScanned }
 
-        #if canImport(Darwin)
-        let fd = open(options.root, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard fd >= 0 else { throw ScanError.rootUnreadable(errno: errno) }
-        let rootFD = Int32(fd)
-        #else
-        throw ScanError.rootUnreadable(errno: 0)
-        #endif
+        let rootProbe = Self.openDirectory(options.root, noFollow: false)
+        guard rootProbe >= 0 else {
+            // No scan will ever run on this instance: end the progress stream (review fix H).
+            progressContinuation.finish()
+            throw ScanError.rootUnreadable(errno: errno)
+        }
+        _ = close(rootProbe) // jobs open by path; this was only the readability probe
 
         let start = ContinuousClock.now
 
         // Enqueue the root job; workers start below, after the continuation is stored.
         core.withLock { core in
-            core.queues[0].append(DirJob(nodeID: 0, fd: rootFD, path: options.root))
+            core.queues[0].append(DirJob(nodeID: 0, path: options.root))
             core.startedAt = start
         }
 
-        return try await withCheckedThrowingContinuation { [self] cont in
-            core.withLock { $0.continuation = cont }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { [self] cont in
+                core.withLock { $0.continuation = cont }
 
-            // Progress publisher at 10 Hz (SPEC §4). Stored before workers start so the
-            // completion path can always cancel it.
-            let progressTask = Task(priority: .utility) { [self] in
-                await self.runProgressLoop(start: start)
-            }
-            core.withLock { $0.progressTask = progressTask }
-
-            for index in 0..<workerCount {
-                let thread = Thread { [self] in
-                    self.workerLoop(index: index)
+                // Progress publisher at 10 Hz (SPEC §4). Stored before workers start so the
+                // completion path can always cancel it.
+                let progressTask = Task(priority: .utility) { [self] in
+                    await self.runProgressLoop(start: start)
                 }
-                thread.name = "ScannerKit.worker-\(index)"
-                thread.start()
+                core.withLock { $0.progressTask = progressTask }
+
+                for index in 0..<workerCount {
+                    let thread = Thread { [self] in
+                        self.workerLoop(index: index)
+                    }
+                    thread.name = "ScannerKit.worker-\(index)"
+                    thread.start()
+                }
             }
+        } onCancel: { [self] in
+            // Cancelling the awaiting Task cancels the scan (review fix H).
+            cancel()
         }
     }
 
@@ -410,14 +437,8 @@ extension ParallelScanner {
         let progressTask = core.progressTask
         core.progressTask = nil
         if cancelled {
-            // Workers exit without draining queued jobs; close their fds.
-            for queue in core.queues {
-                for job in queue {
-                    #if canImport(Darwin)
-                    _ = close(job.fd)
-                    #endif
-                }
-            }
+            // Jobs carry no fds (they open by path when they run), so cancelling can
+            // never leak queued descriptors; just drop the queued work.
             core.queues = Array(repeating: [], count: core.queues.count)
             return DeliveryPayload(
                 continuation: continuation, stream: stream, progressTask: progressTask,
@@ -501,91 +522,75 @@ extension ParallelScanner {
     // MARK: Processing one directory
 
     private func process(_ job: DirJob, workerIndex: Int, buffer: UnsafeMutableRawPointer) {
-        defer {
-            #if canImport(Darwin)
-            _ = close(job.fd)
-            #endif
-        }
-
         var smalls: [SmallFileRecord] = []
 
-        listing: while true {
-            if cancelFlag.load(ordering: .relaxed) { break }
-            let n = DirectoryReader.readEntries(
-                fd: job.fd, buffer: buffer, bufferSize: DirectoryReader.defaultBufferBytes)
-            if n < 0 {
-                handleDirErrorLocked(job, errno: errno)
-                break
-            }
-            if n == 0 { break }
-            let entries = DirectoryReader.parseAttrBuffer(
-                UnsafeRawBufferPointer(start: buffer, count: DirectoryReader.defaultBufferBytes),
-                count: n)
-            if entries.isEmpty { break } // malformed batch; next readEntries returns fresh data
-
-            // Phase 2 (no lock): open child directories with openat.
-            var childFDs: [Int32] = []
-            var childErrnos: [Int32] = []
-            var childPaths: [String?] = []
-            childFDs.reserveCapacity(entries.count)
-            for entry in entries {
-                guard entry.objType == Attr.ObjType.vdir, let name = entry.name else {
-                    childFDs.append(-1)
-                    childErrnos.append(0)
-                    childPaths.append(nil)
-                    continue
+        // The fd lives only for this listing (review fix D/E: nothing is enqueued with
+        // an fd, so cancellation can never leak descriptors).
+        let fd = Self.openDirectory(job.path, noFollow: job.nodeID != 0)
+        if fd < 0 {
+            markDirFailureLocked(job, errno: errno)
+        } else {
+            defer { _ = close(fd) }
+            listing: while true {
+                if cancelFlag.load(ordering: .relaxed) { break }
+                let n = DirectoryReader.readEntries(
+                    fd: fd, buffer: buffer, bufferSize: DirectoryReader.defaultBufferBytes)
+                if n < 0 {
+                    markDirFailureLocked(job, errno: errno)
+                    break
                 }
-                let path = Self.childPath(parent: job.path, name: name)
-                if isRootScan {
-                    if options.skipPaths.contains(path) || path == "/private/var/vm" {
+                if n == 0 { break }
+                let entries = DirectoryReader.parseAttrBuffer(
+                    UnsafeRawBufferPointer(start: buffer, count: DirectoryReader.defaultBufferBytes),
+                    count: n)
+                if entries.isEmpty { break } // malformed batch; next readEntries returns fresh data
+
+                // Classify entries (no lock, no fd opens). childMarkers per entry:
+                // 0 = enqueue a job, -1 = skip entirely (skip list / /private/var/vm),
+                // -2 = mount boundary leaf.
+                var childPaths: [String?] = []
+                var childMarkers: [Int32] = []
+                childPaths.reserveCapacity(entries.count)
+                childMarkers.reserveCapacity(entries.count)
+                for entry in entries {
+                    guard entry.objType == Attr.ObjType.vdir, let name = entry.name else {
+                        childPaths.append(nil)
+                        childMarkers.append(0)
+                        continue
+                    }
+                    let path = Self.childPath(parent: job.path, name: name)
+                    if isRootScan,
+                        options.skipPaths.contains(path) || path == "/private/var/vm"
+                    {
                         if path == "/private/var/vm" {
                             varVMRequested.store(true, ordering: .relaxed)
                         }
-                        childFDs.append(-1)
-                        childErrnos.append(-1) // marker: skip entirely
                         childPaths.append(path)
+                        childMarkers.append(-1)
                         continue
                     }
-                }
-                if !options.crossMounts, let dev = entry.devid, !allowedDevids.contains(dev) {
-                    // Mount boundary: 0-size leaf, never descended (plan revision 1).
-                    childFDs.append(-1)
-                    childErrnos.append(-2) // marker: mount skip
-                    childPaths.append(path)
-                    continue
-                }
-                #if canImport(Darwin)
-                var nameBytes = name
-                nameBytes.append(0)
-                let childFD = nameBytes.withUnsafeBufferPointer { bytes -> Int32 in
-                    bytes.baseAddress!.withMemoryRebound(to: CChar.self, capacity: bytes.count) {
-                        openat(job.fd, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                    if !options.crossMounts, let dev = entry.devid, !allowedDevids.contains(dev) {
+                        // Mount boundary: 0-size leaf, never descended (plan revision 1).
+                        childPaths.append(path)
+                        childMarkers.append(-2)
+                        continue
                     }
-                }
-                #else
-                let childFD: Int32 = -1
-                #endif
-                if childFD >= 0 {
-                    childFDs.append(childFD)
-                    childErrnos.append(0)
                     childPaths.append(path)
-                } else {
-                    childFDs.append(-1)
-                    childErrnos.append(errno)
-                    childPaths.append(path)
+                    childMarkers.append(0)
                 }
-            }
 
-            // Phase 3: one lock acquisition to append this batch's nodes and jobs.
-            core.withLock { core in
-                appendBatchLocked(
-                    &core, job: job, entries: entries, childFDs: childFDs,
-                    childErrnos: childErrnos, childPaths: childPaths,
-                    workerIndex: workerIndex, smalls: &smalls)
+                // One lock acquisition to append this batch's nodes and jobs.
+                core.withLock { core in
+                    appendBatchLocked(
+                        &core, job: job, entries: entries, childPaths: childPaths,
+                        childMarkers: childMarkers, workerIndex: workerIndex,
+                        smalls: &smalls)
+                }
             }
         }
 
-        // Listing finished (or failed / cancelled): complete the directory.
+        // Listing finished (failed, cancelled, or done): the directory ALWAYS completes
+        // so pending counters stay balanced (review fixes B/C).
         let payload = core.withLock { core -> DeliveryPayload? in
             core.builder.listingDone[Int(job.nodeID)] = true
             finalizeSmallGroupLocked(&core.builder, job: job, smalls: smalls)
@@ -600,16 +605,16 @@ extension ParallelScanner {
         if let payload { deliver(payload) }
     }
 
-    /// The directory's getattrlistbulk failed at the top level: blocked for permission
-    /// errors (recorded, revision plan "Blocked"), otherwise treated as vanished.
-    private func handleDirErrorLocked(_ job: DirJob, errno: Int32) {
+    /// A queued directory could not be listed (open or getattrlistbulk failure).
+    /// Permission errors become blocked nodes; every other error leaves a zero-size
+    /// directory node. Either way the job's final step marks listingDone and finalizes,
+    /// so the completion protocol never wedges (review fixes B/C).
+    private func markDirFailureLocked(_ job: DirJob, errno: Int32) {
         core.withLock { core in
             let i = Int(job.nodeID)
             if errno == EPERM || errno == EACCES {
                 core.builder.tree.kind[i] = .blocked
                 core.builder.blockedIDs.append(job.nodeID)
-            } else {
-                core.builder.tree.kind[i] = .other
             }
         }
     }
@@ -620,10 +625,12 @@ extension ParallelScanner {
 extension ParallelScanner {
     /// Appends one parsed batch to the tree. Per-batch (not per-listing) so memory stays
     /// bounded and other workers can steal early. The directory is NOT completed here;
-    /// its job's final step sets listingDone and runs the finalize chain.
+    /// its job's final step sets listingDone and runs the finalize chain. Child
+    /// directories become path-based jobs — opening (and any open error) happens when
+    /// the child's job runs.
     private func appendBatchLocked(
         _ core: inout ScannerCore, job: DirJob, entries: [RawEntry],
-        childFDs: [Int32], childErrnos: [Int32], childPaths: [String?],
+        childPaths: [String?], childMarkers: [Int32],
         workerIndex: Int, smalls: inout [SmallFileRecord]
     ) {
         for i in entries.indices {
@@ -648,7 +655,7 @@ extension ParallelScanner {
 
             switch entry.objType {
             case Attr.ObjType.vdir:
-                let marker = childErrnos[i]
+                let marker = childMarkers[i]
                 if marker == -1 {
                     continue // skip list or /private/var/vm: no node at all
                 }
@@ -664,31 +671,14 @@ extension ParallelScanner {
                     continue
                 }
                 let isBundle = Self.bundleExtensions.contains { Self.hasExtension(name, $0) }
-                if marker == EPERM || marker == EACCES {
-                    // Blocked directory: counted in the completion protocol, then
-                    // finalized immediately with size 0 (plan revision 3).
-                    let id = core.builder.appendNode(
-                        nameBytes: name, kind: .blocked, parent: job.nodeID,
-                        modTime: entry.modTime ?? 0, accessTime: entry.accessTime ?? 0)
-                    core.builder.blockedIDs.append(id)
-                    core.builder.pendingDirs += 1
-                    core.builder.pendingChildDirs[Int(job.nodeID)] += 1
-                    finalizeChainLocked(&core.builder, start: id)
-                } else if marker != 0 || childFDs[i] < 0 {
-                    // Vanished mid-scan (ENOENT, ELOOP, ...): 0-size other leaf.
-                    _ = core.builder.appendNode(
-                        nameBytes: name, kind: .other, parent: job.nodeID,
-                        modTime: entry.modTime ?? 0, accessTime: entry.accessTime ?? 0)
-                } else {
-                    let id = core.builder.appendNode(
-                        nameBytes: name, kind: isBundle ? NodeKind.bundle : NodeKind.directory,
-                        parent: job.nodeID, modTime: entry.modTime ?? 0,
-                        accessTime: entry.accessTime ?? 0)
-                    core.builder.pendingDirs += 1
-                    core.builder.pendingChildDirs[Int(job.nodeID)] += 1
-                    core.queues[workerIndex].append(
-                        DirJob(nodeID: id, fd: childFDs[i], path: childPaths[i] ?? ""))
-                }
+                let id = core.builder.appendNode(
+                    nameBytes: name, kind: isBundle ? NodeKind.bundle : NodeKind.directory,
+                    parent: job.nodeID, modTime: entry.modTime ?? 0,
+                    accessTime: entry.accessTime ?? 0)
+                core.builder.pendingDirs += 1
+                core.builder.pendingChildDirs[Int(job.nodeID)] += 1
+                core.queues[workerIndex].append(
+                    DirJob(nodeID: id, path: childPaths[i] ?? ""))
 
             case Attr.ObjType.vlnk:
                 // Symlink: leaf with its own (usually zero) alloc size; never followed.
@@ -803,12 +793,20 @@ extension ParallelScanner {
     private func addBytesLocked(
         _ core: inout ScannerCore, nodeID: NodeID, alloc: UInt64, logical: UInt64
     ) {
+        Self.addBytes(&core.builder.tree, nodeID: nodeID, alloc: alloc, logical: logical)
+    }
+
+    /// Adds bytes to a node and all of its ancestors (used by the hard-link owner pass
+    /// and by subtree attachment).
+    static func addBytes(
+        _ tree: inout ScanTree, nodeID: NodeID, alloc: UInt64, logical: UInt64
+    ) {
         var cur = nodeID
         while cur >= 0 {
             let i = Int(cur)
-            core.builder.tree.allocSize[i] &+= alloc
-            core.builder.tree.logicalSize[i] &+= logical
-            cur = core.builder.tree.parent[i]
+            tree.allocSize[i] &+= alloc
+            tree.logicalSize[i] &+= logical
+            cur = tree.parent[i]
         }
     }
 
@@ -836,14 +834,24 @@ extension ParallelScanner {
     private func attachVarVMLocked(_ core: inout ScannerCore) {
         guard varVMRequested.load(ordering: .relaxed) else { return }
         guard let totals = Self.scanDirectorySequentially(path: "/private/var/vm") else { return }
-        guard core.builder.tree.count > 0,
-            let privateVar = core.builder.tree.node(atPath: "/private/var")
-        else { return }
-        let vmID = core.builder.appendNode(
-            nameBytes: Array("vm".utf8), kind: .directory, parent: privateVar,
-            allocSize: totals.alloc, logicalSize: totals.logical,
-            fileCount: UInt32(clamping: totals.files))
-        addBytesLocked(&core, nodeID: vmID, alloc: totals.alloc, logical: totals.logical)
+        _ = Self.attachSubtree(
+            &core.builder, underPath: "/private/var", name: "vm",
+            alloc: totals.alloc, logical: totals.logical, files: totals.files)
+    }
+
+    /// Attaches a completed subtree as one directory node under an existing path. The
+    /// node starts at zero and receives its totals exactly once via addBytes, which also
+    /// pushes them up the ancestors (review fix F: the old code set the sizes on append
+    /// AND added them again). Internal so tests can pin the single-count behavior.
+    static func attachSubtree(
+        _ b: inout BuilderState, underPath: String, name: String,
+        alloc: UInt64, logical: UInt64, files: Int
+    ) -> NodeID? {
+        guard b.tree.count > 0, let parent = b.tree.node(atPath: underPath) else { return nil }
+        let id = b.appendNode(nameBytes: Array(name.utf8), kind: .directory, parent: parent)
+        b.tree.fileCount[Int(id)] = UInt32(clamping: files)
+        addBytes(&b.tree, nodeID: id, alloc: alloc, logical: logical)
+        return id
     }
 
     /// Sequential (single-threaded) recursive measurement used only for the small
