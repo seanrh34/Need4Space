@@ -1,32 +1,27 @@
-#if canImport(Darwin)
 import Darwin
-#endif
 import Foundation
 
-/// Attribute bitmap constants used by getattrlistbulk/getattrlist.
-///
-/// These mirror `sys/attr.h` from the macOS SDK (values are ABI-stable). They are re-declared
-/// here so that the reader and the pure parser below do not depend on how (or whether) the
-/// Swift Darwin overlay imports that header, and so tests can hand-build buffers against the
-/// exact same constants. See getattrlist(2) and getattrlistbulk(2) man pages.
+/// Attribute bitmap values, taken from the SDK's `sys/attr.h` via Darwin (never hand-coded,
+/// so the parser cannot drift from the kernel ABI). See getattrlist(2) and
+/// getattrlistbulk(2).
 enum Attr {
     /// attribute_set_t is 5 x uint32 (commonattr, volattr, dirattr, fileattr, forkattr).
     static let attributeSetByteWidth = 20
 
     // --- common attributes (sys/attr.h, ATTR_CMN_*) ---
-    static let cmnName: UInt32 = 0x0000_0001
-    static let cmnObjType: UInt32 = 0x0000_0008
-    static let cmnModTime: UInt32 = 0x0000_0100
-    static let cmnAccTime: UInt32 = 0x0000_0400
-    static let cmnFileID: UInt32 = 0x0040_0000
-    static let cmnDevID: UInt32 = 0x0100_0000
-    static let cmnError: UInt32 = 0x2000_0000
-    static let cmnReturnedAttrs: UInt32 = 0x4000_0000
+    static let cmnName: UInt32 = UInt32(truncatingIfNeeded: ATTR_CMN_NAME)
+    static let cmnDevID: UInt32 = UInt32(truncatingIfNeeded: ATTR_CMN_DEVID)
+    static let cmnObjType: UInt32 = UInt32(truncatingIfNeeded: ATTR_CMN_OBJTYPE)
+    static let cmnModTime: UInt32 = UInt32(truncatingIfNeeded: ATTR_CMN_MODTIME)
+    static let cmnAccTime: UInt32 = UInt32(truncatingIfNeeded: ATTR_CMN_ACCTIME)
+    static let cmnFileID: UInt32 = UInt32(truncatingIfNeeded: ATTR_CMN_FILEID)
+    static let cmnError: UInt32 = UInt32(truncatingIfNeeded: ATTR_CMN_ERROR)
+    static let cmnReturnedAttrs: UInt32 = UInt32(truncatingIfNeeded: ATTR_CMN_RETURNED_ATTRS)
 
     // --- file attributes (sys/attr.h, ATTR_FILE_*) ---
-    static let fileLinkCount: UInt32 = 0x0000_0001
-    static let fileAllocSize: UInt32 = 0x0000_0004
-    static let fileDataLength: UInt32 = 0x0000_0200
+    static let fileLinkCount: UInt32 = UInt32(truncatingIfNeeded: ATTR_FILE_LINKCOUNT)
+    static let fileAllocSize: UInt32 = UInt32(truncatingIfNeeded: ATTR_FILE_ALLOCSIZE)
+    static let fileDataLength: UInt32 = UInt32(truncatingIfNeeded: ATTR_FILE_DATALENGTH)
 
     // --- fsobj_type_t values (sys/vnode.h vtype), returned as ATTR_CMN_OBJTYPE ---
     enum ObjType {
@@ -39,9 +34,7 @@ enum Attr {
 /// Attribute bitmap passed to getattrlistbulk. Layout mirrors `struct attrlist` in sys/attr.h:
 /// uint16 bitmapcount, uint16 reserved, then attribute_set_t (5 x uint32).
 struct AttrListRequest {
-    /// ATTR_BIT_MAP_COUNT from sys/attr.h: number of valid bitmaps in the struct.
-    static let bitmapCount: UInt16 = 5
-    var bitmapcount: UInt16 = AttrListRequest.bitmapCount
+    var bitmapcount: UInt16 = UInt16(truncatingIfNeeded: ATTR_BIT_MAP_COUNT)
     var reserved: UInt16 = 0
     var commonattr: UInt32 = 0
     var volattr: UInt32 = 0
@@ -87,7 +80,7 @@ enum DirectoryReader {
 
     /// FSOPT_PACK_INVAL_ATTRS (sys/attr.h): requested-but-invalid attributes are packed as
     /// zeroed placeholders instead of being omitted, so every record has a uniform layout.
-    static let fsOptPackInvalAttrs: UInt64 = 0x0000_0001
+    static let fsOptPackInvalAttrs: UInt64 = UInt64(FSOPT_PACK_INVAL_ATTRS)
 
     /// The attribute set requested for every listing. The record layout walked by the parser
     /// is derived from this fixed request (packed under FSOPT_PACK_INVAL_ATTRS).
@@ -103,56 +96,45 @@ enum DirectoryReader {
     /// reliably import <sys/attr.h> where getattrlistbulk is declared.
     /// Signature matches getattrlistbulk(2): returns the number of entries placed in the
     /// buffer, 0 at end of directory, or -1 with errno set on error.
-    #if canImport(Darwin)
     @_silgen_name("getattrlistbulk")
     private static func sys_getattrlistbulk(
         _ fd: Int32, _ attrList: UnsafeMutableRawPointer, _ attributeBuffer: UnsafeMutableRawPointer,
         _ bufferSize: Int, _ options: UInt64
     ) -> Int32
-    #endif
 
     /// Fills `buffer` with the next batch of directory entries of `fd`.
-    #if canImport(Darwin)
     static func readEntries(
         fd: Int32, buffer: UnsafeMutableRawPointer, bufferSize: Int
     ) -> Int {
         var req = request()
         return withUnsafeMutableBytes(of: &req) { reqBytes -> Int in
-            let raw = Int32(sys_getattrlistbulk(
-                fd, reqBytes.baseAddress!, buffer, bufferSize, fsOptPackInvalAttrs))
+            let raw = sys_getattrlistbulk(
+                fd, reqBytes.baseAddress!, buffer, bufferSize, fsOptPackInvalAttrs)
             return Int(raw)
         }
     }
-    #else
-    static func readEntries(
-        fd: Int32, buffer: UnsafeMutableRawPointer, bufferSize: Int
-    ) -> Int {
-        _ = fd; _ = buffer; _ = bufferSize
-        preconditionFailure("getattrlistbulk is only available on Darwin")
-    }
-    #endif
 
     // MARK: - Pure buffer parser
 
     /// Requested common attributes (excluding the two special cases RETURNED_ATTRS and ERROR,
-    /// which are handled in the record header), in ascending bit order, with their packed
-    /// byte sizes. getattrlistbulk(2): attributes are packed in ascending bitmap order, and
-    /// with FSOPT_PACK_INVAL_ATTRS every requested attribute occupies its slot.
+    /// which are handled in the record header) with their packed byte sizes. The parser walks
+    /// them in ASCENDING BIT ORDER, as getattrlistbulk(2) packs them; the table is kept
+    /// sorted at initialization so it always follows the SDK constants.
     private static let commonFieldLayout: [(bit: UInt32, byteWidth: Int)] = [
         (Attr.cmnName, 8), // attrreference_t: int32 offset, uint32 length
+        (Attr.cmnDevID, 4), // dev_t is int32 on macOS
         (Attr.cmnObjType, 4),
         (Attr.cmnModTime, 16), // struct timespec: 2 x 8 bytes
         (Attr.cmnAccTime, 16),
         (Attr.cmnFileID, 8),
-        (Attr.cmnDevID, 4), // dev_t is int32 on macOS
-    ]
+    ].sorted { $0.bit < $1.bit }
 
     /// Requested file attributes in ascending bit order with their packed sizes.
     private static let fileFieldLayout: [(bit: UInt32, byteWidth: Int)] = [
         (Attr.fileLinkCount, 4),
         (Attr.fileAllocSize, 8),
         (Attr.fileDataLength, 8),
-    ]
+    ].sorted { $0.bit < $1.bit }
 
     /// Parses a getattrlistbulk result buffer.
     ///
@@ -163,10 +145,11 @@ enum DirectoryReader {
     ///    requested.
     ///  - ATTR_CMN_ERROR (uint32) immediately after the returned set, iff its bit is set in
     ///    returned.commonattr (the special case shown in the man page example).
-    ///  - the remaining requested common attributes in ascending bit order, then requested
-    ///    file attributes in ascending bit order. Under FSOPT_PACK_INVAL_ATTRS each requested
-    ///    attribute occupies its slot even when invalid (zero-filled placeholder); a value is
-    ///    only used when its bit is set in the returned set.
+    ///  - the remaining requested common attributes in ascending bit order (NAME, DEVID,
+    ///    OBJTYPE, MODTIME, ACCTIME, FILEID), then requested file attributes in ascending
+    ///    bit order (LINKCOUNT, ALLOCSIZE, DATALENGTH). Under FSOPT_PACK_INVAL_ATTRS each
+    ///    requested attribute occupies its slot even when invalid (zero-filled placeholder);
+    ///    a value is only used when its bit is set in the returned set.
     ///  - an attrreference_t field holds int32 attr_dataoffset relative to the attrreference_t
     ///    field's own address and uint32 attr_length including the terminating NUL.
     ///
@@ -244,6 +227,9 @@ enum DirectoryReader {
                 switch bit {
                 case Attr.cmnName:
                     nameSlot = slot
+                case Attr.cmnDevID:
+                    entry.devid = Int32(bitPattern: buf.loadUnaligned(
+                        fromByteOffset: slot, as: UInt32.self))
                 case Attr.cmnObjType:
                     entry.objType = buf.loadUnaligned(fromByteOffset: slot, as: UInt32.self)
                 case Attr.cmnModTime:
@@ -252,9 +238,6 @@ enum DirectoryReader {
                     entry.accessTime = timespecSeconds(buf, slot)
                 case Attr.cmnFileID:
                     entry.fileID = buf.loadUnaligned(fromByteOffset: slot, as: UInt64.self)
-                case Attr.cmnDevID:
-                    entry.devid = Int32(bitPattern: buf.loadUnaligned(
-                        fromByteOffset: slot, as: UInt32.self))
                 default:
                     break
                 }
