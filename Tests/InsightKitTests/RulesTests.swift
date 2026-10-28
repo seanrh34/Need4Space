@@ -72,6 +72,26 @@ private func insights(_ tree: ScanTree, homePath: String = home) -> [Insight] {
     #expect(insights(tree).contains(where: { $0.id == "xcode.derivedData" }) == false)
 }
 
+@Test func perRuleMinimumOverride() throws {
+    let tree = FixtureTree.build([
+        .dir("Library", [
+            .dir("Developer", [
+                .dir("Xcode", [
+                    .dir("DerivedData", [.file("Build", 150 * mb)]),
+                ]),
+            ]),
+        ]),
+    ])
+    #expect(insights(tree).contains(where: { $0.id == "xcode.derivedData" }) == false)
+
+    var rule = try #require(RuleTable.all.first { $0.id == "xcode.derivedData" })
+    rule.minBytes = 100 * mb
+    let custom = RuleEngine(rules: [rule]).evaluate(tree: tree, homePath: home).insights
+    let insight = try #require(custom.first)
+    #expect(insight.id == "xcode.derivedData")
+    #expect(insight.bytes == 150 * mb)
+}
+
 @Test func exactMinimumIsShown() {
     let tree = FixtureTree.build([
         .dir("Library", [
