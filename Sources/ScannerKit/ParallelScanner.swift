@@ -52,14 +52,10 @@ public enum ScanError: Error, Sendable {
     case rootUnreadable(errno: Int32)
 }
 
-/// A directory-listing task. Queues hold bare node IDs (4 bytes each); a worker builds
-/// the absolute path by walking parents under the lock when it pops the job. The
-/// directory is OPENED when the job runs, so at most workerCount+1 fds are ever open.
-struct QueuedDir: Sendable {
-    let nodeID: NodeID
-}
-
-/// A directory job handed to a worker: node plus its materialized path.
+/// A directory job handed to a worker: node plus its materialized path. Queues hold
+/// bare node IDs; the path is built by walking parents under the lock when the job
+/// pops (review round 2 fix 4). The directory is OPENED when the job runs, so at most
+/// workerCount+1 fds are ever open and nothing queued can leak fds on cancellation.
 struct DirJob: Sendable {
     let nodeID: NodeID
     let path: String
@@ -392,7 +388,9 @@ extension ParallelScanner {
 
     /// Live pruned copy of the tree for the UI sunburst (plan revision 4): nodes down to
     /// `maxDepth` whose subtree alloc size is at least `minFraction` of the root total.
-    /// Throttled to at most one build per second.
+    /// Throttled to at most one build per second. This is a DURING-scan API: once the
+    /// scan completes (or is cancelled) the internal tree is released and only the
+    /// returned `ScanResult` holds the final tree.
     public func snapshotTree(maxDepth: Int = 4, minFraction: Double = 0.001) -> ScanTree {
         core.withLock { core -> ScanTree in
             let now = ContinuousClock.now
@@ -492,6 +490,8 @@ extension ParallelScanner {
         core.snapshotTime = nil
         core.queues = Array(repeating: [], count: core.queues.count)
         if cancelled {
+            // Free the tree promptly; the result is discarded anyway.
+            core.builder = BuilderState(rootPath: options.root, reserveCapacity: 0)
             core.builder.pendingDirs = 0
             return DeliveryPayload(
                 continuation: continuation, stream: stream, progressTask: progressTask,
@@ -708,11 +708,15 @@ extension ParallelScanner {
         }
 
         // Listing finished (failed, cancelled, or done): the directory ALWAYS completes
-        // so pending counters stay balanced (review fixes B/C).
+        // so pending counters stay balanced (review fixes B/C). After a delivery the
+        // core only holds an empty stub, so tree bookkeeping is skipped (a worker can
+        // still be finishing its job when a cancelled delivery happened).
         let payload = core.withLock { core -> DeliveryPayload? in
-            core.builder.markListingDone(job.nodeID)
-            finalizeSmallGroupLocked(&core.builder, job: job, agg: smalls)
-            finalizeChainLocked(&core.builder, start: job.nodeID)
+            if !core.done {
+                core.builder.markListingDone(job.nodeID)
+                finalizeSmallGroupLocked(&core.builder, job: job, agg: smalls)
+                finalizeChainLocked(&core.builder, start: job.nodeID)
+            }
             core.activeJobs -= 1
             _ = dirsScanned.add(1, ordering: .relaxed)
             if !core.resultDelivered, core.builder.pendingDirs == 0, core.activeJobs == 0 {
@@ -730,6 +734,8 @@ extension ParallelScanner {
     /// never wedges (review fixes B/C, round 2 fix 7).
     private func markDirFailureLocked(_ job: DirJob, errno: Int32) {
         core.withLock { core in
+            // Post-delivery the core holds an empty stub; node ids are stale.
+            if core.done { return }
             let i = Int(job.nodeID)
             if errno == EPERM || errno == EACCES {
                 core.builder.tree.kind[i] = .blocked
@@ -754,6 +760,8 @@ extension ParallelScanner {
         childPaths: [String?], childMarkers: [Int32],
         workerIndex: Int, smalls: inout SmallAgg
     ) {
+        // Post-delivery the core holds an empty stub; node ids would be stale.
+        if core.done { return }
         for i in entries.indices {
             let entry = entries[i]
 
@@ -906,12 +914,6 @@ extension ParallelScanner {
             }
             cur = parent
         }
-    }
-
-    private func addBytesLocked(
-        _ core: inout ScannerCore, nodeID: NodeID, alloc: UInt64, logical: UInt64
-    ) {
-        Self.addBytes(&core.builder.tree, nodeID: nodeID, alloc: alloc, logical: logical)
     }
 
     /// Adds bytes to a node and all of its ancestors (used by the hard-link owner pass
